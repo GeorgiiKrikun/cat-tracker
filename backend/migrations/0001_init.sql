@@ -16,8 +16,27 @@ CREATE TABLE sessions (
 );
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 
+-- Whoever is being observed: a cat, or yourself for a migraine diary.
+-- Created via the CLI (`cattracker add-patient`).
+CREATE TABLE patients (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    icon       TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Which users can see and log for which patient (`cattracker share`).
+-- A patient can be shared by several users, or private to one.
+CREATE TABLE patient_access (
+    patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (patient_id, user_id)
+);
+CREATE INDEX idx_access_user ON patient_access(user_id);
+
 -- Symptom (and medication) definitions. These are data, edited in the app's
--- settings screen, so new symptoms never need a code change.
+-- settings screen, so new symptoms never need a code change. Each patient
+-- has their own list; entries belong to a patient through their symptom.
 --
 -- kind:
 --   bool    one tap = "it happened"                  (value: "yes")
@@ -29,6 +48,7 @@ CREATE INDEX idx_sessions_user ON sessions(user_id);
 --   note    free text only                           (value: NULL, text in note)
 CREATE TABLE symptom_types (
     id         INTEGER PRIMARY KEY,
+    patient_id INTEGER NOT NULL REFERENCES patients(id),
     name       TEXT NOT NULL,
     kind       TEXT NOT NULL CHECK (kind IN ('bool','count','scale','choice','number','med','note')),
     unit       TEXT,              -- unit for number, default dose for med
@@ -38,6 +58,7 @@ CREATE TABLE symptom_types (
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+CREATE INDEX idx_symptoms_patient ON symptom_types(patient_id, sort_order);
 
 -- Options of scale/choice symptoms. Entries point at an option by id, so
 -- renaming the label renames it everywhere. Options that have entries are
@@ -55,6 +76,7 @@ CREATE INDEX idx_options_symptom ON symptom_options(symptom_id, sort_order);
 
 -- Logged observations. The id is a client-generated UUID so that entries
 -- queued while offline can be re-sent safely (inserts are idempotent).
+-- logged_by records who logged it, which matters for shared patients.
 -- option_id is set for scale/choice entries (value is then NULL); the
 -- composite key makes sure the option belongs to the entry's symptom.
 CREATE TABLE entries (
@@ -72,27 +94,5 @@ CREATE INDEX idx_entries_time ON entries(occurred_at);
 CREATE INDEX idx_entries_symptom_time ON entries(symptom_id, occurred_at);
 CREATE INDEX idx_entries_option ON entries(option_id);
 
--- Starter set. Everything here can be renamed, archived or reordered in the app.
-INSERT INTO symptom_types (id, name, kind, unit, icon, pinned, sort_order) VALUES
-    (1,  'Omeprazole',    'med',    NULL,     '💊', 1, 10),
-    (2,  'Emeprid',       'med',    NULL,     '💊', 1, 11),
-    (3,  'Pronefra',      'med',    NULL,     '💊', 1, 12),
-    (4,  'Prednisolone',  'med',    NULL,     '💊', 1, 13),
-    (5,  'Appetite',      'scale',  NULL,     '🍽️', 1, 20),
-    (6,  'Vomited',       'count',  NULL,     '🤮', 1, 21),
-    (7,  'Stool',         'choice', NULL,     '💩', 1, 22),
-    (8,  'Drinking',      'scale',  NULL,     '💧', 1, 23),
-    (9,  'Peeing',        'scale',  NULL,     '🚽', 0, 24),
-    (10, 'Night waking',  'scale',  NULL,     '🌙', 1, 25),
-    (11, 'Energy',        'scale',  NULL,     '⚡', 0, 26),
-    (12, 'Weight',        'number', 'kg',     '⚖️', 0, 30),
-    (13, 'Blood glucose', 'number', 'mmol/L', '🩸', 0, 31),
-    (14, 'Note',          'note',   NULL,     '📝', 1, 40);
-
-INSERT INTO symptom_options (symptom_id, label, sort_order) VALUES
-    (5,  'none', 0), (5,  'little', 1), (5,  'normal', 2), (5,  'good', 3),
-    (7,  'normal', 0), (7,  'soft', 1), (7,  'diarrhea', 2), (7,  'hard', 3), (7,  'with blood', 4),
-    (8,  'less', 0), (8,  'normal', 1), (8,  'more', 2), (8,  'a lot', 3),
-    (9,  'less', 0), (9,  'normal', 1), (9,  'more', 2), (9,  'a lot', 3),
-    (10, 'mild', 0), (10, 'moderate', 1), (10, 'intense', 2),
-    (11, 'very low', 0), (11, 'low', 1), (11, 'normal', 2), (11, 'playful', 3);
+-- Starter symptom sets are presets in backend/src/patients.rs, applied by
+-- `cattracker add-patient --preset ...`.

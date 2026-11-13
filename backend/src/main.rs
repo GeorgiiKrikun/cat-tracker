@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod error;
+mod patients;
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -89,6 +90,22 @@ enum Cmd {
     DelUser { username: String },
     /// List users.
     Users,
+    /// Create a patient (whoever is observed: a cat, yourself…).
+    AddPatient {
+        name: String,
+        /// Emoji shown next to the name.
+        #[arg(long)]
+        icon: Option<String>,
+        /// Starter symptoms to create with it.
+        #[arg(long, value_enum, default_value_t = patients::Preset::None)]
+        preset: patients::Preset,
+    },
+    /// Let a user see and log for a patient. PATIENT is its id or name.
+    Share { patient: String, username: String },
+    /// Take a user's access to a patient away (their entries are kept).
+    Unshare { patient: String, username: String },
+    /// List patients and who can see them.
+    Patients,
     /// Local development only: add a `demo`/`demo` user and two weeks of fake entries.
     SeedDemo,
 }
@@ -196,13 +213,33 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
         .await?,
     };
 
+    let seeded: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM patients p JOIN patient_access a ON a.patient_id = p.id
+          WHERE p.name = 'Demo cat' AND a.user_id = ?",
+    )
+    .bind(uid)
+    .fetch_optional(db)
+    .await?;
+    anyhow::ensure!(seeded.is_none(), "demo data is already there (start over with `just clean-db`)");
+
+    let pid = patients::create(db, "Demo cat", Some("🐱"), patients::Preset::Cat).await?;
+    sqlx::query("INSERT INTO patient_access (patient_id, user_id) VALUES (?, ?)")
+        .bind(pid)
+        .bind(uid)
+        .execute(db)
+        .await?;
+
     let syms: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT id, name, kind FROM symptom_types WHERE archived = 0")
+        sqlx::query_as("SELECT id, name, kind FROM symptom_types WHERE patient_id = ?")
+            .bind(pid)
             .fetch_all(db)
             .await?;
     let options: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT symptom_id, id FROM symptom_options WHERE retired = 0 ORDER BY sort_order, id",
+        "SELECT o.symptom_id, o.id FROM symptom_options o
+           JOIN symptom_types s ON s.id = o.symptom_id
+          WHERE s.patient_id = ? ORDER BY o.sort_order, o.id",
     )
+    .bind(pid)
     .fetch_all(db)
     .await?;
 
@@ -251,7 +288,7 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
             }
         }
     }
-    println!("Seeded {count} demo entries. Log in with demo / demo (local development only!).");
+    println!("Seeded patient \"Demo cat\" with {count} entries. Log in with demo / demo (local development only!).");
     Ok(())
 }
 
@@ -314,7 +351,151 @@ async fn main() -> anyhow::Result<()> {
                 println!("{u:<16} {d:<20} created {c}");
             }
         }
+        Cmd::AddPatient { name, icon, preset } => {
+            let id = patients::create(&db, &name, icon.as_deref(), preset).await?;
+            println!("Created patient {name} (id {id}). Give someone access: cattracker share {id} <username>");
+        }
+        Cmd::Share { patient, username } => {
+            let (id, name) = patients::resolve(&db, &patient).await?;
+            patients::share(&db, id, &username).await?;
+            println!("{username} can now see {name}.");
+        }
+        Cmd::Unshare { patient, username } => {
+            let (id, name) = patients::resolve(&db, &patient).await?;
+            if patients::unshare(&db, id, &username).await? {
+                println!("{username} can no longer see {name}.");
+            } else {
+                println!("{username} didn't have access to {name}.");
+            }
+        }
+        Cmd::Patients => {
+            for (id, name, icon, users) in patients::overview(&db).await? {
+                let label = format!("{} {name}", icon.unwrap_or_default());
+                println!("{id:<4} {:<24} {}", label.trim(), users.as_deref().unwrap_or("(nobody)"));
+            }
+        }
         Cmd::SeedDemo => seed_demo(&db).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    struct TestApp {
+        router: Router,
+        db: SqlitePool,
+        path: PathBuf,
+    }
+
+    impl Drop for TestApp {
+        fn drop(&mut self) {
+            for ext in ["", "-shm", "-wal"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", self.path.display()));
+            }
+        }
+    }
+
+    impl TestApp {
+        async fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("cattracker-test-{}.db", uuid::Uuid::new_v4()));
+            let db = open_db(&path).await.unwrap();
+            let state = AppState { db: db.clone(), cookie_secure: false };
+            TestApp { router: app(state, PathBuf::from("/nonexistent")), db, path }
+        }
+
+        /// Create a user and return a session cookie for them.
+        async fn user(&self, name: &str) -> String {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO users (username, display_name, password_hash) VALUES (?, ?, 'x') RETURNING id",
+            )
+            .bind(name)
+            .bind(name)
+            .fetch_one(&self.db)
+            .await
+            .unwrap();
+            format!("{}={}", auth::SESSION_COOKIE, auth::create_session(&self.db, id).await.unwrap())
+        }
+
+        async fn call(&self, cookie: &str, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(body.map_or(Body::empty(), |b| Body::from(b.to_string())))
+                .unwrap();
+            let res = self.router.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+    }
+
+    #[tokio::test]
+    async fn patients_are_only_visible_to_users_they_are_shared_with() {
+        let t = TestApp::new().await;
+        let (me, wife) = (t.user("me").await, t.user("wife").await);
+        let cat = patients::create(&t.db, "Cat", None, patients::Preset::Cat).await.unwrap();
+        let mine = patients::create(&t.db, "Migraine", None, patients::Preset::None).await.unwrap();
+        for (p, u) in [(cat, "me"), (cat, "wife"), (mine, "me")] {
+            patients::share(&t.db, p, u).await.unwrap();
+        }
+
+        // Each user lists only their patients, with who else can see them.
+        let (_, list) = t.call(&me, "GET", "/api/patients", None).await;
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        let (_, list) = t.call(&wife, "GET", "/api/patients", None).await;
+        assert_eq!(list, json!([{ "id": cat, "name": "Cat", "icon": null, "shared_with": ["me"] }]));
+
+        // My private patient: I can add a symptom and log it.
+        let (st, sym) = t
+            .call(&me, "POST", &format!("/api/patients/{mine}/symptoms"), Some(json!({ "name": "Headache", "kind": "count" })))
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, entry) = t
+            .call(&me, "POST", &format!("/api/patients/{mine}/entries"), Some(json!({ "symptom_id": sym["id"] })))
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let eid = entry["id"].as_str().unwrap();
+
+        // Wife can't see or touch it, not even through the shared patient's routes.
+        for (method, uri, body) in [
+            ("GET", format!("/api/patients/{mine}/symptoms"), None),
+            ("GET", format!("/api/patients/{mine}/entries"), None),
+            ("POST", format!("/api/patients/{mine}/entries"), Some(json!({ "symptom_id": sym["id"] }))),
+            ("POST", format!("/api/patients/{cat}/entries"), Some(json!({ "symptom_id": sym["id"] }))),
+            ("PATCH", format!("/api/patients/{cat}/entries/{eid}"), Some(json!({ "note": "x" }))),
+            ("DELETE", format!("/api/patients/{cat}/entries/{eid}"), None),
+            ("PATCH", format!("/api/patients/{cat}/symptoms/{}", sym["id"]), Some(json!({ "name": "x" }))),
+        ] {
+            let (st, _) = t.call(&wife, method, &uri, body).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        let (_, mine_entries) = t.call(&me, "GET", &format!("/api/patients/{mine}/entries"), None).await;
+        assert_eq!(mine_entries.as_array().unwrap().len(), 1);
+
+        // On the shared cat, entries record who logged them.
+        let (_, cat_syms) = t.call(&wife, "GET", &format!("/api/patients/{cat}/symptoms"), None).await;
+        let vomited = cat_syms.as_array().unwrap().iter().find(|s| s["name"] == "Vomited").unwrap();
+        let (_, e) = t
+            .call(&wife, "POST", &format!("/api/patients/{cat}/entries"), Some(json!({ "symptom_id": vomited["id"] })))
+            .await;
+        assert_eq!(e["logged_by_name"], "wife");
+        let (_, seen_by_me) = t.call(&me, "GET", &format!("/api/patients/{cat}/entries"), None).await;
+        assert_eq!(seen_by_me[0]["logged_by_name"], "wife");
+
+        // Unsharing takes access away.
+        patients::unshare(&t.db, cat, "wife").await.unwrap();
+        let (st, _) = t.call(&wife, "GET", &format!("/api/patients/{cat}/entries"), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
 }

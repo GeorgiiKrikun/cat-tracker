@@ -5,6 +5,7 @@ A small installable web app (PWA) for logging a cat's symptoms and medications f
 - **One-tap logging.** Meds, vomiting and other "it happened" items log on tap, with Undo/Edit in the toast. Scales (appetite, drinking…) take one more tap.
 - **Configurable symptoms.** Add, rename, pin, reorder or archive symptoms in Settings. New symptoms need no code change.
 - **Who did what.** Every entry records who logged it, which prevents double-dosing meds.
+- **Several patients.** Track a cat together, and keep your own migraine diary private. Each patient has their own symptoms, and is shared only with the users you choose.
 - **Vet summary.** 7/14/30-day charts per symptom, printable as a PDF, plus CSV export.
 - **Works offline.** Entries logged without signal queue on the phone and sync later.
 
@@ -32,9 +33,21 @@ just dev             # API on :8080 + UI on :5173 with hot reload, Ctrl-C stops 
 
 `just dev-backend` and `just dev-frontend` run the two halves separately, if you prefer two terminals.
 
-Open http://localhost:5173 and log in as `demo` / `demo`.
+Open http://localhost:5173 and log in as `demo` / `demo`. The demo user sees one patient, "Demo cat".
 
-Create real users with `just user georgii Georgii`. You'll be prompted for the password.
+Create real users with `just user georgii Georgii`. You'll be prompted for the password. Then create patients and decide who can see them:
+
+```bash
+just patient Murka cat          # new patient with the cat starter symptoms
+just patient "Georgii" none     # empty patient; add symptoms in the app's Settings
+just share Murka georgii        # patients are referred to by name or id
+just share Murka wife
+just share Georgii georgii      # private: only shared with you
+just patients                   # who can see what
+just unshare Murka wife         # take access away (entries are kept)
+```
+
+A user with several patients gets a switcher at the top of the app.
 
 Other commands: `just test` (Rust tests + Svelte type check), `just clean-db`.
 
@@ -76,6 +89,9 @@ mkdir -p data && sudo chown 10001 data    # container runs as uid 10001
 NPM_NETWORK=npm_default docker compose up -d
 docker compose exec cattracker cattracker add-user georgii --display-name Georgii
 docker compose exec cattracker cattracker add-user <wife> --display-name <Name>
+docker compose exec cattracker cattracker add-patient Murka --icon 🐱 --preset cat
+docker compose exec cattracker cattracker share Murka georgii
+docker compose exec cattracker cattracker share Murka <wife>
 ```
 
 In the Nginx Proxy Manager UI:
@@ -123,9 +139,15 @@ In Docker, prefix these with `docker compose exec cattracker`.
 | `CT_COOKIE_SECURE` | `true` | Keep `true` behind HTTPS; `false` only for plain-http local dev |
 | `RUST_LOG` | `cattracker=info` | Log level |
 
+## Patients and access
+
+A **patient** is whoever is observed: the cat, or yourself. `patient_access` lists which users can see each patient, so a patient can be shared (the cat) or private (your migraines). Symptoms belong to a patient, and entries belong to a patient through their symptom. Every entry records who logged it (`logged_by`).
+
+All symptom and entry routes live under `/api/patients/{pid}/…`. A user without access to a patient gets 404, as if it didn't exist.
+
 ## How symptoms work
 
-Symptoms are rows in `symptom_types`, and each has a **kind** that decides how it's logged:
+Symptoms are rows in `symptom_types`, each belonging to one patient, and each has a **kind** that decides how it's logged:
 
 | Kind | Logging | Example |
 |---|---|---|
@@ -137,7 +159,7 @@ Symptoms are rows in `symptom_types`, and each has a **kind** that decides how i
 | `number` | type a value with a unit | Weight (kg), glucose (mmol/L) |
 | `note` | free text | Anything unusual |
 
-The starter set lives in `backend/migrations/0001_init.sql`. Everything is editable in the app. A symptom's kind can't change after creation, because that would make old entries meaningless; archive it and create a new one instead.
+Starter sets are presets in `backend/src/patients.rs` (`--preset cat`). Everything is editable in the app. A symptom's kind can't change after creation, because that would make old entries meaningless; archive it and create a new one instead.
 
 ### Options (scale and choice)
 
@@ -154,17 +176,20 @@ Options live in `symptom_options`, and entries point at them by id. That way his
 POST   /api/auth/login        {username, password}
 POST   /api/auth/logout
 GET    /api/me
-GET    /api/symptoms[?include_archived=true]
-POST   /api/symptoms          {name, kind, options?, unit?, icon?, pinned?}
-PATCH  /api/symptoms/{id}     any of: name, options, unit, icon, pinned, archived
-                              options = full ordered list [{id?, label, retired}]; no id = new
-POST   /api/symptoms/{id}/options/{option_id}/merge   {into: option_id}
-PUT    /api/symptoms/order    [id, id, …]
-GET    /api/entries?from=&to=&symptom_id=&limit=
-POST   /api/entries           {id?: uuid, symptom_id, value? | option_id?, note?, occurred_at?}   (idempotent on id)
-PATCH  /api/entries/{id}      {value? | option_id?, note?, occurred_at?}
-DELETE /api/entries/{id}
-GET    /api/export.csv?from=&to=
+GET    /api/patients          patients you can see: [{id, name, icon, shared_with}]
+
+Below, P = /api/patients/{pid} (404 without access to that patient):
+GET    P/symptoms[?include_archived=true]
+POST   P/symptoms          {name, kind, options?, unit?, icon?, pinned?}
+PATCH  P/symptoms/{id}     any of: name, options, unit, icon, pinned, archived
+                           options = full ordered list [{id?, label, retired}]; no id = new
+POST   P/symptoms/{id}/options/{option_id}/merge   {into: option_id}
+PUT    P/symptoms/order    [id, id, …]
+GET    P/entries?from=&to=&symptom_id=&limit=
+POST   P/entries           {id?: uuid, symptom_id, value? | option_id?, note?, occurred_at?}   (idempotent on id)
+PATCH  P/entries/{id}      {value? | option_id?, note?, occurred_at?}
+DELETE P/entries/{id}
+GET    P/export.csv?from=&to=
 ```
 
 ## Ideas for later

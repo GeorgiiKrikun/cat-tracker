@@ -16,6 +16,15 @@ export interface User {
   display_name: string;
 }
 
+/** Whoever is observed: a cat, or yourself. Shared between users or private. */
+export interface Patient {
+  id: number;
+  name: string;
+  icon: string | null;
+  /** Display names of the other users who can see this patient. */
+  shared_with: string[];
+}
+
 export interface SymptomOption {
   id: number;
   label: string;
@@ -107,30 +116,36 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return res.json() as Promise<T>;
 }
 
+/** Everything about symptoms and entries lives under the patient it belongs to. */
+const pp = (pid: number) => `/patients/${pid}`;
+
 export const api = {
   me: () => request<User>('GET', '/me'),
   login: (username: string, password: string) =>
     request<User>('POST', '/auth/login', { username, password }),
   logout: () => request<void>('POST', '/auth/logout'),
+  patients: () => request<Patient[]>('GET', '/patients'),
 
-  symptoms: (includeArchived = false) =>
-    request<Symptom[]>('GET', `/symptoms${includeArchived ? '?include_archived=true' : ''}`),
-  createSymptom: (s: SymptomInput) => request<Symptom>('POST', '/symptoms', s),
-  updateSymptom: (id: number, s: SymptomInput) => request<Symptom>('PATCH', `/symptoms/${id}`, s),
+  symptoms: (pid: number, includeArchived = false) =>
+    request<Symptom[]>('GET', `${pp(pid)}/symptoms${includeArchived ? '?include_archived=true' : ''}`),
+  createSymptom: (pid: number, s: SymptomInput) => request<Symptom>('POST', `${pp(pid)}/symptoms`, s),
+  updateSymptom: (pid: number, id: number, s: SymptomInput) =>
+    request<Symptom>('PATCH', `${pp(pid)}/symptoms/${id}`, s),
   /** Move all entries of option `from` to option `into`, then delete `from`. */
-  mergeOption: (symptomId: number, from: number, into: number) =>
-    request<Symptom>('POST', `/symptoms/${symptomId}/options/${from}/merge`, { into }),
-  reorderSymptoms: (ids: number[]) => request<void>('PUT', '/symptoms/order', ids),
+  mergeOption: (pid: number, symptomId: number, from: number, into: number) =>
+    request<Symptom>('POST', `${pp(pid)}/symptoms/${symptomId}/options/${from}/merge`, { into }),
+  reorderSymptoms: (pid: number, ids: number[]) => request<void>('PUT', `${pp(pid)}/symptoms/order`, ids),
 
-  entries: (params: { from?: string; to?: string; symptom_id?: number; limit?: number } = {}) => {
+  entries: (pid: number, params: { from?: string; to?: string; symptom_id?: number; limit?: number } = {}) => {
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) if (v !== undefined) q.set(k, String(v));
-    return request<Entry[]>('GET', `/entries?${q}`);
+    return request<Entry[]>('GET', `${pp(pid)}/entries?${q}`);
   },
-  createEntry: (e: NewEntry) => request<Entry>('POST', '/entries', e),
-  updateEntry: (id: string, e: Partial<EntryValue> & { note?: string | null; occurred_at?: string }) =>
-    request<Entry>('PATCH', `/entries/${id}`, e),
-  deleteEntry: (id: string) => request<void>('DELETE', `/entries/${id}`),
+  createEntry: (pid: number, e: NewEntry) => request<Entry>('POST', `${pp(pid)}/entries`, e),
+  updateEntry: (pid: number, id: string, e: Partial<EntryValue> & { note?: string | null; occurred_at?: string }) =>
+    request<Entry>('PATCH', `${pp(pid)}/entries/${id}`, e),
+  deleteEntry: (pid: number, id: string) => request<void>('DELETE', `${pp(pid)}/entries/${id}`),
+  exportUrl: (pid: number, from: string) => `/api${pp(pid)}/export.csv?from=${encodeURIComponent(from)}`,
 };
 
 /** crypto.randomUUID only exists in secure contexts; fall back for plain-http LAN testing. */

@@ -18,6 +18,7 @@ use crate::{
     auth::{self, CurrentUser},
     error::{AppError, AppResult},
     normalize_ts, now_ts,
+    patients::{self, Patient},
 };
 
 pub fn router() -> Router<AppState> {
@@ -26,13 +27,15 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
-        .route("/symptoms", get(list_symptoms).post(create_symptom))
-        .route("/symptoms/order", put(reorder_symptoms))
-        .route("/symptoms/{id}", patch(update_symptom))
-        .route("/symptoms/{id}/options/{option_id}/merge", post(merge_option))
-        .route("/entries", get(list_entries).post(create_entry))
-        .route("/entries/{id}", patch(update_entry).delete(delete_entry))
-        .route("/export.csv", get(export_csv))
+        .route("/patients", get(patients::list))
+        // Everything below belongs to one patient; the `Patient` extractor checks access.
+        .route("/patients/{pid}/symptoms", get(list_symptoms).post(create_symptom))
+        .route("/patients/{pid}/symptoms/order", put(reorder_symptoms))
+        .route("/patients/{pid}/symptoms/{id}", patch(update_symptom))
+        .route("/patients/{pid}/symptoms/{id}/options/{option_id}/merge", post(merge_option))
+        .route("/patients/{pid}/entries", get(list_entries).post(create_entry))
+        .route("/patients/{pid}/entries/{id}", patch(update_entry).delete(delete_entry))
+        .route("/patients/{pid}/export.csv", get(export_csv))
 }
 
 // ---------- auth ----------
@@ -158,34 +161,38 @@ impl Symptom {
     }
 }
 
-async fn fetch_symptom(st: &AppState, id: i64) -> AppResult<SymptomRow> {
+/// A symptom of this patient (404 for other patients' symptoms).
+async fn fetch_symptom(st: &AppState, pid: i64, id: i64) -> AppResult<SymptomRow> {
     sqlx::query_as(
         "SELECT id, name, kind, unit, icon, pinned, archived, sort_order
-           FROM symptom_types WHERE id = ?",
+           FROM symptom_types WHERE id = ? AND patient_id = ?",
     )
     .bind(id)
+    .bind(pid)
     .fetch_optional(&st.db)
     .await?
     .ok_or(AppError::NotFound)
 }
 
-/// Options of one symptom, or of all symptoms when `symptom_id` is None.
-async fn fetch_options(st: &AppState, symptom_id: Option<i64>) -> AppResult<Vec<SymptomOption>> {
+/// Options of one symptom, or of all the patient's symptoms when `symptom_id` is None.
+async fn fetch_options(st: &AppState, pid: i64, symptom_id: Option<i64>) -> AppResult<Vec<SymptomOption>> {
     Ok(sqlx::query_as(
         "SELECT o.id, o.symptom_id, o.label, o.retired,
                 (SELECT COUNT(*) FROM entries e WHERE e.option_id = o.id) AS uses
            FROM symptom_options o
-          WHERE (?1 IS NULL OR o.symptom_id = ?1)
+           JOIN symptom_types s ON s.id = o.symptom_id
+          WHERE s.patient_id = ?1 AND (?2 IS NULL OR o.symptom_id = ?2)
           ORDER BY o.symptom_id, o.sort_order, o.id",
     )
+    .bind(pid)
     .bind(symptom_id)
     .fetch_all(&st.db)
     .await?)
 }
 
-async fn symptom_with_options(st: &AppState, id: i64) -> AppResult<Symptom> {
-    let row = fetch_symptom(st, id).await?;
-    Ok(Symptom::new(row, fetch_options(st, Some(id)).await?))
+async fn symptom_with_options(st: &AppState, pid: i64, id: i64) -> AppResult<Symptom> {
+    let row = fetch_symptom(st, pid, id).await?;
+    Ok(Symptom::new(row, fetch_options(st, pid, Some(id)).await?))
 }
 
 #[derive(Deserialize)]
@@ -195,21 +202,22 @@ struct ListSymptomsQ {
 }
 
 async fn list_symptoms(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
     Query(q): Query<ListSymptomsQ>,
 ) -> AppResult<Json<Vec<Symptom>>> {
     let rows: Vec<SymptomRow> = sqlx::query_as(
         "SELECT id, name, kind, unit, icon, pinned, archived, sort_order
            FROM symptom_types
-          WHERE (? OR archived = 0)
+          WHERE patient_id = ? AND (? OR archived = 0)
           ORDER BY sort_order, id",
     )
+    .bind(p.id)
     .bind(q.include_archived)
     .fetch_all(&st.db)
     .await?;
     let mut by_symptom: HashMap<i64, Vec<SymptomOption>> = HashMap::new();
-    for o in fetch_options(&st, None).await? {
+    for o in fetch_options(&st, p.id, None).await? {
         by_symptom.entry(o.symptom_id).or_default().push(o);
     }
     Ok(Json(
@@ -326,7 +334,7 @@ async fn save_options(
 }
 
 async fn create_symptom(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
     Json(inp): Json<SymptomInput>,
 ) -> AppResult<(StatusCode, Json<Symptom>)> {
@@ -343,14 +351,17 @@ async fn create_symptom(
         check_options(&mut options, &[])?;
     }
     let mut tx = st.db.begin().await?;
-    let next_order: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM symptom_types")
-            .fetch_one(&mut *tx)
-            .await?;
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO symptom_types (name, kind, unit, icon, pinned, sort_order)
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+    let next_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM symptom_types WHERE patient_id = ?",
     )
+    .bind(p.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO symptom_types (patient_id, name, kind, unit, icon, pinned, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(p.id)
     .bind(&name)
     .bind(&kind)
     .bind(clean_opt_text(inp.unit.flatten()))
@@ -363,16 +374,16 @@ async fn create_symptom(
         save_options(&mut tx, id, &options, &[]).await?;
     }
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(symptom_with_options(&st, id).await?)))
+    Ok((StatusCode::CREATED, Json(symptom_with_options(&st, p.id, id).await?)))
 }
 
 async fn update_symptom(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
-    Path(id): Path<i64>,
+    Path((_, id)): Path<(i64, i64)>,
     Json(inp): Json<SymptomInput>,
 ) -> AppResult<Json<Symptom>> {
-    let cur = fetch_symptom(&st, id).await?;
+    let cur = fetch_symptom(&st, p.id, id).await?;
     if inp.kind.as_deref().is_some_and(|k| k != cur.kind) {
         // Changing the kind would make old entries meaningless.
         return Err(AppError::BadRequest(
@@ -392,7 +403,7 @@ async fn update_symptom(
         None => cur.icon,
     };
     let mut options = inp.options.filter(|_| has_options(&cur.kind));
-    let existing = fetch_options(&st, Some(id)).await?;
+    let existing = fetch_options(&st, p.id, Some(id)).await?;
     if let Some(o) = options.as_mut() {
         check_options(o, &existing)?;
     }
@@ -415,7 +426,7 @@ async fn update_symptom(
         save_options(&mut tx, id, &o, &existing).await?;
     }
     tx.commit().await?;
-    Ok(Json(symptom_with_options(&st, id).await?))
+    Ok(Json(symptom_with_options(&st, p.id, id).await?))
 }
 
 #[derive(Deserialize)]
@@ -426,12 +437,12 @@ struct MergeInput {
 /// Move all entries of one option to another option of the same symptom,
 /// then delete the now unused option. The only operation that rewrites history.
 async fn merge_option(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
-    Path((symptom_id, from)): Path<(i64, i64)>,
+    Path((_, symptom_id, from)): Path<(i64, i64, i64)>,
     Json(inp): Json<MergeInput>,
 ) -> AppResult<Json<Symptom>> {
-    let existing = fetch_options(&st, Some(symptom_id)).await?;
+    let existing = fetch_options(&st, p.id, Some(symptom_id)).await?;
     let belongs = |id| existing.iter().any(|o| o.id == id);
     if !belongs(from) || !belongs(inp.into) {
         return Err(AppError::NotFound);
@@ -450,19 +461,20 @@ async fn merge_option(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Json(symptom_with_options(&st, symptom_id).await?))
+    Ok(Json(symptom_with_options(&st, p.id, symptom_id).await?))
 }
 
 async fn reorder_symptoms(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
     Json(ids): Json<Vec<i64>>,
 ) -> AppResult<StatusCode> {
     let mut tx = st.db.begin().await?;
     for (i, id) in ids.iter().enumerate() {
-        sqlx::query("UPDATE symptom_types SET sort_order = ? WHERE id = ?")
+        sqlx::query("UPDATE symptom_types SET sort_order = ? WHERE id = ? AND patient_id = ?")
             .bind(i as i64)
             .bind(id)
+            .bind(p.id)
             .execute(&mut *tx)
             .await?;
     }
@@ -496,7 +508,7 @@ struct ListEntriesQ {
     limit: Option<i64>,
 }
 
-async fn query_entries(st: &AppState, q: &ListEntriesQ) -> AppResult<Vec<Entry>> {
+async fn query_entries(st: &AppState, pid: i64, q: &ListEntriesQ) -> AppResult<Vec<Entry>> {
     let from = q.from.as_deref().map(normalize_ts).transpose()?;
     let to = q.to.as_deref().map(normalize_ts).transpose()?;
     let limit = q.limit.unwrap_or(2000).clamp(1, 10_000);
@@ -508,7 +520,8 @@ async fn query_entries(st: &AppState, q: &ListEntriesQ) -> AppResult<Vec<Entry>>
            JOIN symptom_types s ON s.id = e.symptom_id
            LEFT JOIN symptom_options o ON o.id = e.option_id
            LEFT JOIN users u ON u.id = e.logged_by
-          WHERE (?1 IS NULL OR e.occurred_at >= ?1)
+          WHERE s.patient_id = ?5
+            AND (?1 IS NULL OR e.occurred_at >= ?1)
             AND (?2 IS NULL OR e.occurred_at <  ?2)
             AND (?3 IS NULL OR e.symptom_id = ?3)
           ORDER BY e.occurred_at DESC
@@ -518,20 +531,22 @@ async fn query_entries(st: &AppState, q: &ListEntriesQ) -> AppResult<Vec<Entry>>
     .bind(to)
     .bind(q.symptom_id)
     .bind(limit)
+    .bind(pid)
     .fetch_all(&st.db)
     .await?;
     Ok(rows)
 }
 
 async fn list_entries(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
     Query(q): Query<ListEntriesQ>,
 ) -> AppResult<Json<Vec<Entry>>> {
-    Ok(Json(query_entries(&st, &q).await?))
+    Ok(Json(query_entries(&st, p.id, &q).await?))
 }
 
-async fn fetch_entry(st: &AppState, id: &str) -> AppResult<Entry> {
+/// An entry of this patient (404 for other patients' entries).
+async fn fetch_entry(st: &AppState, pid: i64, id: &str) -> AppResult<Entry> {
     sqlx::query_as(
         "SELECT e.id, e.symptom_id, s.name AS symptom_name, s.kind, e.option_id,
                 COALESCE(o.label, e.value) AS value, e.note,
@@ -540,9 +555,10 @@ async fn fetch_entry(st: &AppState, id: &str) -> AppResult<Entry> {
            JOIN symptom_types s ON s.id = e.symptom_id
            LEFT JOIN symptom_options o ON o.id = e.option_id
            LEFT JOIN users u ON u.id = e.logged_by
-          WHERE e.id = ?",
+          WHERE e.id = ? AND s.patient_id = ?",
     )
     .bind(id)
+    .bind(pid)
     .fetch_optional(&st.db)
     .await?
     .ok_or(AppError::NotFound)
@@ -610,12 +626,12 @@ struct EntryInput {
 }
 
 async fn create_entry(
-    user: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
     Json(inp): Json<EntryInput>,
 ) -> AppResult<(StatusCode, Json<Entry>)> {
-    let sym = fetch_symptom(&st, inp.symptom_id).await?;
-    let options = fetch_options(&st, Some(sym.id)).await?;
+    let sym = fetch_symptom(&st, p.id, inp.symptom_id).await?;
+    let options = fetch_options(&st, p.id, Some(sym.id)).await?;
     let note = clean_opt_text(inp.note);
     let v = validate_value(&sym, &options, inp.value, inp.option_id, &note)?;
     let occurred_at = match inp.occurred_at.as_deref() {
@@ -638,11 +654,11 @@ async fn create_entry(
     .bind(v.option_id)
     .bind(v.value)
     .bind(note)
-    .bind(user.id)
+    .bind(p.user.id)
     .bind(occurred_at)
     .execute(&st.db)
     .await?;
-    Ok((StatusCode::CREATED, Json(fetch_entry(&st, &id).await?)))
+    Ok((StatusCode::CREATED, Json(fetch_entry(&st, p.id, &id).await?)))
 }
 
 #[derive(Deserialize)]
@@ -654,14 +670,14 @@ struct EntryPatch {
 }
 
 async fn update_entry(
-    _u: CurrentUser,
+    pat: Patient,
     State(st): State<AppState>,
-    Path(id): Path<String>,
+    Path((_, id)): Path<(i64, String)>,
     Json(p): Json<EntryPatch>,
 ) -> AppResult<Json<Entry>> {
-    let cur = fetch_entry(&st, &id).await?;
-    let sym = fetch_symptom(&st, cur.symptom_id).await?;
-    let options = fetch_options(&st, Some(sym.id)).await?;
+    let cur = fetch_entry(&st, pat.id, &id).await?;
+    let sym = fetch_symptom(&st, pat.id, cur.symptom_id).await?;
+    let options = fetch_options(&st, pat.id, Some(sym.id)).await?;
     let note = match p.note {
         Some(n) => clean_opt_text(n),
         None => cur.note,
@@ -684,18 +700,22 @@ async fn update_entry(
         .bind(&id)
         .execute(&st.db)
         .await?;
-    Ok(Json(fetch_entry(&st, &id).await?))
+    Ok(Json(fetch_entry(&st, pat.id, &id).await?))
 }
 
 async fn delete_entry(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
-    Path(id): Path<String>,
+    Path((_, id)): Path<(i64, String)>,
 ) -> AppResult<StatusCode> {
-    let res = sqlx::query("DELETE FROM entries WHERE id = ?")
-        .bind(&id)
-        .execute(&st.db)
-        .await?;
+    let res = sqlx::query(
+        "DELETE FROM entries
+          WHERE id = ? AND symptom_id IN (SELECT id FROM symptom_types WHERE patient_id = ?)",
+    )
+    .bind(&id)
+    .bind(p.id)
+    .execute(&st.db)
+    .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
@@ -713,7 +733,7 @@ fn csv_field(s: &str) -> String {
 }
 
 async fn export_csv(
-    _u: CurrentUser,
+    p: Patient,
     State(st): State<AppState>,
     Query(q): Query<ListEntriesQ>,
 ) -> AppResult<impl IntoResponse> {
@@ -721,7 +741,7 @@ async fn export_csv(
         limit: Some(q.limit.unwrap_or(10_000)),
         ..q
     };
-    let rows = query_entries(&st, &q).await?;
+    let rows = query_entries(&st, p.id, &q).await?;
     let mut out = String::from("occurred_at,symptom,value,note,logged_by\n");
     for e in rows.iter().rev() {
         out.push_str(&format!(

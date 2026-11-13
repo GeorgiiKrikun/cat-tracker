@@ -14,9 +14,11 @@
   $effect(() => {
     void store.version;
     const r = range;
+    const pid = store.patientId;
+    if (pid === null) return;
     loading = true;
     error = '';
-    Promise.all([api.symptoms(true), api.entries({ from: startOfDay(r - 1).toISOString(), limit: 10000 })])
+    Promise.all([api.symptoms(pid, true), api.entries(pid, { from: startOfDay(r - 1).toISOString(), limit: 10000 })])
       .then(([s, e]) => {
         symptoms = s;
         entries = e;
@@ -83,7 +85,7 @@
   }
 
   function exportUrl() {
-    return `/api/export.csv?from=${encodeURIComponent(startOfDay(range - 1).toISOString())}`;
+    return store.patientId === null ? '' : api.exportUrl(store.patientId, startOfDay(range - 1).toISOString());
   }
 
   // Tick labels: first, last and every ~7th day.
@@ -99,7 +101,7 @@
 </div>
 
 <div class="print-head">
-  <h1>Symptom summary</h1>
+  <h1>Symptom summary{store.patient ? ` · ${store.patient.name}` : ''}</h1>
   <p class="muted">{dayLabel(days[0])} – {dayLabel(days[days.length - 1])} · {entries.length} entries</p>
 </div>
 

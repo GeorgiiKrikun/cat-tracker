@@ -37,7 +37,7 @@
   async function symptomFor(e: Entry): Promise<Symptom> {
     const s = store.symptoms.find((x) => x.id === e.symptom_id);
     if (s) return s;
-    const all = await api.symptoms(true);
+    const all = await api.symptoms(store.patientId!, true);
     const found = all.find((x) => x.id === e.symptom_id);
     if (!found) throw new Error('symptom not found');
     return found;
@@ -82,7 +82,23 @@
   <LoginView />
 {:else}
   <header class="top no-print">
-    <h1>{tabs.find((t) => t.id === tab)?.label}</h1>
+    <div class="titles">
+      <h1>{tabs.find((t) => t.id === tab)?.label}</h1>
+      {#if store.patients.length > 1}
+        <select
+          class="patient"
+          aria-label="Patient"
+          value={store.patientId}
+          onchange={(e) => store.selectPatient(Number(e.currentTarget.value))}
+        >
+          {#each store.patients as p (p.id)}
+            <option value={p.id}>{[p.icon, p.name].filter(Boolean).join(' ')}</option>
+          {/each}
+        </select>
+      {:else if store.patient}
+        <span class="patient-name small muted">{[store.patient.icon, store.patient.name].filter(Boolean).join(' ')}</span>
+      {/if}
+    </div>
     <div class="status small">
       {#if !store.online}<span class="chip pending">offline</span>{/if}
       {#if store.queue.length}<span class="chip pending">{store.queue.length} to sync</span>{/if}
@@ -90,7 +106,16 @@
   </header>
 
   <main>
-    {#if tab === 'log'}
+    {#if !store.patient && tab !== 'settings'}
+      <div class="card empty">
+        <p><b>No patients yet.</b></p>
+        <p class="muted">
+          Someone with access to the server needs to create one and share it with you, e.g.
+          <code>cattracker add-patient Murka --preset cat</code> and
+          <code>cattracker share Murka {store.user.username}</code>.
+        </p>
+      </div>
+    {:else if tab === 'log'}
       <LogView onopen={(s) => (logging = s)} onedit={(id) => openEdit(id)} />
     {:else if tab === 'history'}
       <HistoryView onedit={(e) => openEdit(e)} />
@@ -145,6 +170,14 @@
     backdrop-filter: blur(8px);
   }
   .status { display: flex; gap: 6px; }
+  .titles { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+  .patient-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .patient {
+    width: auto; max-width: 50vw; padding: 4px 10px; border-radius: 99px; font-size: 14px; font-weight: 600;
+    background: var(--surface-2); border: 0;
+  }
+  .empty { padding: 4px 16px; margin-top: 8px; }
+  .empty code { background: var(--surface-2); padding: 1px 5px; border-radius: 5px; font-size: 13px; }
   main { padding: 4px 16px calc(var(--nav-h) + var(--safe-b) + 90px); max-width: 640px; margin: 0 auto; }
   nav {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; display: flex;

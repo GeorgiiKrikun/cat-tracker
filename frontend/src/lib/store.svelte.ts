@@ -1,10 +1,23 @@
-import { api, ApiError, uuid, type Entry, type EntryValue, type NewEntry, type Symptom, type User } from './api';
+import {
+  api,
+  ApiError,
+  uuid,
+  type Entry,
+  type EntryValue,
+  type NewEntry,
+  type Patient,
+  type Symptom,
+  type User,
+} from './api';
 import { startOfDay } from './time';
 
 const LS = {
   user: 'ct.user',
-  symptoms: 'ct.symptoms',
-  recent: 'ct.recent',
+  patients: 'ct.patients',
+  patient: 'ct.patient',
+  // Cached per patient, so switching works offline and never shows another patient's data.
+  symptoms: (pid: number) => `ct.symptoms.${pid}`,
+  recent: (pid: number) => `ct.recent.${pid}`,
   queue: 'ct.queue',
 };
 
@@ -23,15 +36,32 @@ function save(key: string, v: unknown) {
     /* storage full or unavailable */
   }
 }
+function forgetCaches() {
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (k.startsWith('ct.symptoms.') || k.startsWith('ct.recent.')) localStorage.removeItem(k);
+    }
+    localStorage.removeItem(LS.patients);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** An entry waiting to be sent, remembering which patient it belongs to. */
+type QueuedEntry = NewEntry & { patient_id: number };
 
 /** How far back the home screen keeps entries in memory. */
 const RECENT_DAYS = 3;
 
+const initialPatient = load<number | null>(LS.patient, null);
+
 class Store {
   user = $state<User | null>(load(LS.user, null));
-  symptoms = $state<Symptom[]>(load(LS.symptoms, []));
-  recent = $state<Entry[]>(load(LS.recent, []));
-  queue = $state<NewEntry[]>(load(LS.queue, []));
+  patients = $state<Patient[]>(load(LS.patients, []));
+  patientId = $state<number | null>(initialPatient);
+  symptoms = $state<Symptom[]>(initialPatient === null ? [] : load(LS.symptoms(initialPatient), []));
+  recent = $state<Entry[]>(initialPatient === null ? [] : load(LS.recent(initialPatient), []));
+  queue = $state<QueuedEntry[]>(load(LS.queue, []));
   online = $state(navigator.onLine);
   ready = $state(false);
   toast = $state<{ text: string; undoId?: string; error?: boolean } | null>(null);
@@ -40,6 +70,7 @@ class Store {
 
   private toastTimer: ReturnType<typeof setTimeout> | undefined;
 
+  patient = $derived(this.patients.find((p) => p.id === this.patientId) ?? null);
   pinned = $derived(this.symptoms.filter((s) => s.pinned));
   unpinned = $derived(this.symptoms.filter((s) => !s.pinned));
 
@@ -65,11 +96,15 @@ class Store {
   }
 
   private setUser(u: User | null) {
+    const changed = u?.id !== this.user?.id;
     this.user = u;
     save(LS.user, u);
-    if (!u) {
+    if (changed) {
+      // Another person on this device must not see the previous one's patients.
+      forgetCaches();
+      this.patients = [];
+      this.symptoms = [];
       this.recent = [];
-      save(LS.recent, []);
     }
   }
 
@@ -87,15 +122,37 @@ class Store {
     this.setUser(null);
   }
 
+  /** Switch to another patient: show their cached data at once, then refresh. */
+  async selectPatient(id: number) {
+    if (id === this.patientId) return;
+    this.patientId = id;
+    save(LS.patient, id);
+    this.symptoms = load(LS.symptoms(id), []);
+    this.recent = load(LS.recent(id), []);
+    this.version++;
+    await this.refresh();
+  }
+
   async refresh() {
     await this.flush();
     try {
+      this.patients = await api.patients();
+      save(LS.patients, this.patients);
+      if (!this.patients.some((p) => p.id === this.patientId)) {
+        this.patientId = this.patients[0]?.id ?? null;
+        save(LS.patient, this.patientId);
+        this.symptoms = [];
+        this.recent = [];
+      }
+      const pid = this.patientId;
+      if (pid === null) return;
       const [symptoms, recent] = await Promise.all([
-        api.symptoms(),
-        api.entries({ from: startOfDay(RECENT_DAYS).toISOString(), limit: 1000 }),
+        api.symptoms(pid),
+        api.entries(pid, { from: startOfDay(RECENT_DAYS).toISOString(), limit: 1000 }),
       ]);
+      if (pid !== this.patientId) return; // switched meanwhile
       this.symptoms = symptoms;
-      save(LS.symptoms, symptoms);
+      save(LS.symptoms(pid), symptoms);
       this.setRecent(recent);
       this.version++;
     } catch (e) {
@@ -104,8 +161,14 @@ class Store {
   }
 
   async reloadSymptoms() {
-    this.symptoms = await api.symptoms();
-    save(LS.symptoms, this.symptoms);
+    const pid = this.patientId;
+    if (pid === null) return;
+    this.symptoms = await api.symptoms(pid);
+    save(LS.symptoms(pid), this.symptoms);
+  }
+
+  private saveRecent() {
+    if (this.patientId !== null) save(LS.recent(this.patientId), this.recent);
   }
 
   private setRecent(serverEntries: Entry[]) {
@@ -115,7 +178,7 @@ class Store {
     const merged = [...pending, ...serverEntries.filter((e) => !pendingIds.has(e.id))];
     merged.sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
     this.recent = merged;
-    save(LS.recent, merged);
+    this.saveRecent();
   }
 
   lastFor(symptomId: number): Entry | undefined {
@@ -127,10 +190,12 @@ class Store {
     return this.recent.filter((e) => e.symptom_id === symptomId && e.occurred_at >= start).length;
   }
 
-  /** Log an entry. Shows immediately; syncs now or when back online. */
+  /** Log an entry for the current patient. Shows immediately; syncs now or when back online. */
   async log(sym: Symptom, { value, option_id }: EntryValue, note: string | null = null, occurredAt?: string) {
-    const e: NewEntry = {
+    if (this.patientId === null) return;
+    const e: QueuedEntry = {
       id: uuid(),
+      patient_id: this.patientId,
       symptom_id: sym.id,
       value,
       option_id,
@@ -143,10 +208,12 @@ class Store {
         ? (sym.options.find((o) => o.id === option_id)?.label ?? null)
         : (value ?? (sym.kind === 'bool' ? 'yes' : sym.kind === 'count' ? '1' : null));
     const local: Entry = {
-      ...e,
+      id: e.id,
+      symptom_id: sym.id,
       option_id,
       value: shown,
       note,
+      occurred_at: e.occurred_at,
       symptom_name: sym.name,
       kind: sym.kind,
       logged_by: this.user?.id ?? null,
@@ -157,7 +224,7 @@ class Store {
     this.recent = [local, ...this.recent].sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
     this.queue = [...this.queue, e];
     save(LS.queue, this.queue);
-    save(LS.recent, this.recent);
+    this.saveRecent();
 
     const label = shown && sym.kind !== 'count' && sym.kind !== 'bool' ? `${sym.name}: ${shown}` : sym.name;
     this.showToast(`Logged ${label}`, e.id);
@@ -170,19 +237,19 @@ class Store {
     this.flushing = true;
     try {
       while (this.queue.length) {
-        const next = this.queue[0];
+        const { patient_id, ...next } = this.queue[0];
         try {
-          const saved = await api.createEntry(next);
+          const saved = await api.createEntry(patient_id, next);
           if (!this.queue.some((q) => q.id === next.id)) {
             // Undone while it was being sent: remove it on the server too.
-            await api.deleteEntry(saved.id).catch(() => {});
-          } else {
+            await api.deleteEntry(patient_id, saved.id).catch(() => {});
+          } else if (patient_id === this.patientId) {
             this.recent = this.recent.map((r) => (r.id === saved.id ? saved : r));
           }
           this.version++;
         } catch (err) {
-          if (err instanceof ApiError && err.status === 400) {
-            // Server rejected it (e.g. symptom changed); drop it so the queue isn't stuck.
+          if (err instanceof ApiError && (err.status === 400 || err.status === 404)) {
+            // Server rejected it (symptom changed, access removed); drop it so the queue isn't stuck.
             this.recent = this.recent.filter((r) => r.id !== next.id);
             this.showToast(`Couldn't save: ${err.message}`, undefined, true);
           } else {
@@ -195,29 +262,30 @@ class Store {
       }
     } finally {
       this.flushing = false;
-      save(LS.recent, this.recent);
+      this.saveRecent();
     }
   }
 
   async remove(id: string) {
-    const queued = this.queue.some((q) => q.id === id);
+    const queued = this.queue.find((q) => q.id === id);
     if (queued) {
       this.queue = this.queue.filter((q) => q.id !== id);
       save(LS.queue, this.queue);
-    } else {
-      await api.deleteEntry(id);
+    } else if (this.patientId !== null) {
+      await api.deleteEntry(this.patientId, id);
     }
     this.recent = this.recent.filter((r) => r.id !== id);
-    save(LS.recent, this.recent);
+    this.saveRecent();
     this.version++;
   }
 
   async update(id: string, patch: Partial<EntryValue> & { note?: string | null; occurred_at?: string }) {
-    const saved = await api.updateEntry(id, patch);
+    if (this.patientId === null) throw new Error('No patient selected');
+    const saved = await api.updateEntry(this.patientId, id, patch);
     this.recent = this.recent
       .map((r) => (r.id === id ? saved : r))
       .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
-    save(LS.recent, this.recent);
+    this.saveRecent();
     this.version++;
     return saved;
   }

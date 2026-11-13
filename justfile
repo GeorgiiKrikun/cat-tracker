@@ -92,6 +92,26 @@ seed:
 user name display=name:
     CT_DB_PATH={{db}} cargo run -q -- add-user {{name}} --display-name "{{display}}"
 
+# Create a patient, optionally with starter symptoms: just patient Murka cat
+[working-directory: 'backend']
+patient name preset="none":
+    CT_DB_PATH={{db}} cargo run -q -- add-patient "{{name}}" --preset {{preset}}
+
+# Let a user see and log for a patient (id or name): just share Murka georgii
+[working-directory: 'backend']
+share patient user:
+    CT_DB_PATH={{db}} cargo run -q -- share "{{patient}}" {{user}}
+
+# Take a user's access to a patient away (their entries stay)
+[working-directory: 'backend']
+unshare patient user:
+    CT_DB_PATH={{db}} cargo run -q -- unshare "{{patient}}" {{user}}
+
+# List patients and who can see them
+[working-directory: 'backend']
+patients:
+    CT_DB_PATH={{db}} cargo run -q -- patients
+
 # Backend tests + frontend type check
 test:
     cd backend && cargo test

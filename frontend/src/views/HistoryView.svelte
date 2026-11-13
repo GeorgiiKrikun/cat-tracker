@@ -13,18 +13,23 @@
   let allSymptoms = $state<Symptom[]>([]);
 
   $effect(() => {
-    api.symptoms(true).then((s) => (allSymptoms = s)).catch(() => (allSymptoms = store.symptoms));
+    const pid = store.patientId;
+    symptomId = ''; // filters belong to the previous patient
+    if (pid === null) return;
+    api.symptoms(pid, true).then((s) => (allSymptoms = s)).catch(() => (allSymptoms = store.symptoms));
   });
 
   $effect(() => {
-    // Re-run when filters change or entries were edited elsewhere.
+    // Re-run when filters or the patient change, or entries were edited elsewhere.
     void store.version;
+    const pid = store.patientId;
     const d = days;
     const sid = symptomId === '' ? undefined : symptomId;
+    if (pid === null) return;
     loading = true;
     error = '';
     api
-      .entries({ from: startOfDay(d - 1).toISOString(), symptom_id: sid, limit: 5000 })
+      .entries(pid, { from: startOfDay(d - 1).toISOString(), symptom_id: sid, limit: 5000 })
       .then((r) => (entries = r))
       .catch((e) => (error = store.online ? String(e.message ?? e) : 'Offline — showing nothing until you reconnect.'))
       .finally(() => (loading = false));

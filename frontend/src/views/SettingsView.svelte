@@ -11,10 +11,17 @@
   let error = $state('');
   let busy = $state(false);
 
+  /** Patient whose symptoms are shown (Settings only renders with one selected). */
+  const pid = () => store.patientId!;
+
   async function load() {
-    all = await api.symptoms(true);
+    all = await api.symptoms(pid(), true);
   }
   $effect(() => {
+    if (store.patientId === null) {
+      all = [];
+      return;
+    }
     load().catch(() => (all = store.symptoms));
   });
 
@@ -22,7 +29,7 @@
   const archived = $derived(all.filter((s) => s.archived));
 
   async function patch(s: Symptom, p: SymptomInput) {
-    await api.updateSymptom(s.id, p);
+    await api.updateSymptom(pid(), s.id, p);
     await Promise.all([load(), store.reloadSymptoms()]);
   }
 
@@ -31,7 +38,7 @@
     const j = i + dir;
     if (j < 0 || j >= ids.length) return;
     [ids[i], ids[j]] = [ids[j], ids[i]];
-    await api.reorderSymptoms([...ids, ...archived.map((s) => s.id)]);
+    await api.reorderSymptoms(pid(), [...ids, ...archived.map((s) => s.id)]);
     await Promise.all([load(), store.reloadSymptoms()]);
   }
 
@@ -75,7 +82,7 @@
     if (!confirm(`Move ${n} from “${from.label}” to “${into.label}” and delete “${from.label}”?\n\nThis rewrites history and can't be undone.`)) return;
     error = '';
     try {
-      await api.mergeOption(editing.id, from.id, intoId);
+      await api.mergeOption(pid(), editing.id, from.id, intoId);
       // Apply locally so other unsaved edits in the form survive.
       into.uses += from.uses;
       opts.splice(opts.indexOf(from), 1);
@@ -102,8 +109,8 @@
         .map(({ id, label, retired }) => ({ id, label, retired }));
     }
     try {
-      if (editing.id) await api.updateSymptom(editing.id, body);
-      else await api.createSymptom({ ...body, kind: editing.kind });
+      if (editing.id) await api.updateSymptom(pid(), editing.id, body);
+      else await api.createSymptom(pid(), { ...body, kind: editing.kind });
       editing = null;
       await Promise.all([load(), store.reloadSymptoms()]);
     } catch (e) {
@@ -116,8 +123,12 @@
   const kinds = Object.keys(KIND_LABELS) as Kind[];
 </script>
 
-<h2>Symptoms & medications</h2>
-<p class="muted small">⭐ = shown as a button on the Log screen. The rest are under “More”.</p>
+{#if store.patient}
+<h2>Symptoms & medications{store.patient ? ` · ${store.patient.name}` : ''}</h2>
+<p class="muted small">
+  {#if store.patient?.shared_with.length}Shared with {store.patient.shared_with.join(', ')}.{:else}Only you can see this patient.{/if}
+  ⭐ = shown as a button on the Log screen. The rest are under “More”.
+</p>
 
 <ul class="list card">
   {#each active as s, i (s.id)}
@@ -151,12 +162,16 @@
   </ul>
 {/if}
 
+{/if}
+
 <h2>Account</h2>
 <div class="card account">
   <p>Logged in as <b>{store.user?.display_name}</b> <span class="muted">({store.user?.username})</span></p>
   <button class="btn block" onclick={() => store.logout()}>Log out</button>
 </div>
-<p class="muted small">New people are added on the server with <code>cattracker add-user</code>.</p>
+<p class="muted small">
+  People and patients are managed on the server: <code>cattracker add-user</code>, <code>add-patient</code>, <code>share</code>.
+</p>
 
 {#if editing}
   <Sheet title={editing.id ? `Edit ${editing.name}` : 'New symptom'} onclose={() => (editing = null)}>
