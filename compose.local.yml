@@ -1,0 +1,12 @@
+# Local test of the exact production container, on http://localhost:8080
+# (plain HTTP, so Secure cookies are switched off).
+services:
+  cattracker:
+    build: .
+    image: cattracker:latest
+    environment:
+      CT_COOKIE_SECURE: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data-local:/data

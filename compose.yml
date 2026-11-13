@@ -1,0 +1,17 @@
+# Production: runs behind Nginx Proxy Manager on its Docker network.
+# In NPM add a Proxy Host:  cat.yourdomain.com  ->  http://cattracker:8080
+# (SSL tab: Let's Encrypt + Force SSL + HTTP/2 + HSTS).
+services:
+  cattracker:
+    build: .
+    image: cattracker:latest
+    container_name: cattracker
+    restart: unless-stopped
+    volumes:
+      - ./data:/data            # SQLite database — back this folder up
+    networks: [npm]
+
+networks:
+  npm:
+    external: true
+    name: ${NPM_NETWORK:-npm_default}   # check with: docker network ls
