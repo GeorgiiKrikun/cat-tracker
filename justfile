@@ -92,7 +92,7 @@ seed:
 user name display=name:
     CT_DB_PATH={{db}} cargo run -q -- add-user {{name}} --display-name "{{display}}"
 
-# Create a patient, optionally with starter symptoms: just patient Murka cat
+# Create a patient, optionally with starter trackers: just patient Murka cat
 [working-directory: 'backend']
 patient name preset="none":
     CT_DB_PATH={{db}} cargo run -q -- add-patient "{{name}}" --preset {{preset}}

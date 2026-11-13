@@ -50,7 +50,7 @@ pub fn normalize_ts(s: &str) -> Result<String, AppError> {
 }
 
 #[derive(Parser)]
-#[command(name = "cattracker", about = "Cat symptom tracker server")]
+#[command(name = "cattracker", about = "Cat tracker tracker server")]
 struct Cli {
     /// Path to the SQLite database file (created if missing).
     #[arg(long, env = "CT_DB_PATH", default_value = "data/cattracker.db", global = true)]
@@ -96,7 +96,7 @@ enum Cmd {
         /// Emoji shown next to the name.
         #[arg(long)]
         icon: Option<String>,
-        /// Starter symptoms to create with it.
+        /// Starter trackers to create with it.
         #[arg(long, value_enum, default_value_t = patients::Preset::None)]
         preset: patients::Preset,
     },
@@ -229,15 +229,23 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
         .execute(db)
         .await?;
 
-    let syms: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT id, name, kind FROM symptom_types WHERE patient_id = ?")
+    // The fake history starts two weeks ago, so the trackers have to exist since then
+    // (normal options are only assumed from the day a tracker was created).
+    sqlx::query("UPDATE trackers SET created_at = ? WHERE patient_id = ?")
+        .bind((Utc::now() - chrono::Duration::days(15)).to_rfc3339_opts(SecondsFormat::Millis, true))
+        .bind(pid)
+        .execute(db)
+        .await?;
+
+    let trackers: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, name, kind FROM trackers WHERE patient_id = ?")
             .bind(pid)
             .fetch_all(db)
             .await?;
-    let options: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT o.symptom_id, o.id FROM symptom_options o
-           JOIN symptom_types s ON s.id = o.symptom_id
-          WHERE s.patient_id = ? ORDER BY o.sort_order, o.id",
+    let options: Vec<(i64, i64, bool)> = sqlx::query_as(
+        "SELECT o.tracker_id, o.id, o.normal FROM tracker_options o
+           JOIN trackers t ON t.id = o.tracker_id
+          WHERE t.patient_id = ? ORDER BY o.sort_order, o.id",
     )
     .bind(pid)
     .fetch_all(db)
@@ -249,18 +257,34 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (seed >> 33) % n
     };
+    let at = |day: i64, hours: i64, minutes: u64| {
+        (Utc::now() - chrono::Duration::days(day) - chrono::Duration::hours(hours) - chrono::Duration::minutes(minutes as i64))
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
 
     let mut count = 0;
-    for day in 0..14i64 {
-        let base = Utc::now() - chrono::Duration::days(day);
-        for (id, name, kind) in &syms {
-            let opts: Vec<i64> = options.iter().filter(|(s, _)| s == id).map(|(_, o)| *o).collect();
+    for day in 1..15i64 {
+        // A day nobody logged anything (stays blank), and one with only a check-in.
+        if day == 9 {
+            continue;
+        }
+        if day == 6 {
+            sqlx::query("INSERT INTO checkins (id, patient_id, logged_by, occurred_at) VALUES (?, ?, ?, ?)")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(pid)
+                .bind(uid)
+                .bind(at(day, 4, rnd(50)))
+                .execute(db)
+                .await?;
+            continue;
+        }
+        for (id, name, kind) in &trackers {
+            // Only deviations from normal get logged, like in real use.
+            let unusual: Vec<i64> = options.iter().filter(|(t, _, n)| t == id && !n).map(|(_, o, _)| *o).collect();
             let (times, value, option_id): (u64, Option<String>, Option<i64>) = match kind.as_str() {
                 "med" => (if name == "Omeprazole" { 2 } else { 1 }, Some("given".into()), None),
-                "scale" | "choice" if !opts.is_empty() => {
-                    // Bias towards the middle options.
-                    let i = ((rnd(opts.len() as u64) + rnd(opts.len() as u64)) / 2) as usize;
-                    (1 + rnd(2), None, Some(opts[i.min(opts.len() - 1)]))
+                "scale" | "choice" if !unusual.is_empty() && rnd(10) < 3 => {
+                    (1, None, Some(unusual[rnd(unusual.len() as u64) as usize]))
                 }
                 "count" => (rnd(3).saturating_sub(1), Some("1".into()), None),
                 "number" if name == "Weight" && day % 7 == 0 => {
@@ -269,11 +293,8 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
                 _ => (0, None, None),
             };
             for k in 0..times {
-                let at = base
-                    - chrono::Duration::hours(2 + (k as i64) * 6)
-                    - chrono::Duration::minutes(rnd(50) as i64);
                 sqlx::query(
-                    "INSERT INTO entries (id, symptom_id, option_id, value, logged_by, occurred_at)
+                    "INSERT INTO entries (id, tracker_id, option_id, value, logged_by, occurred_at)
                      VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .bind(uuid::Uuid::new_v4().to_string())
@@ -281,14 +302,14 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
                 .bind(option_id)
                 .bind(&value)
                 .bind(uid)
-                .bind(at.to_rfc3339_opts(SecondsFormat::Millis, true))
+                .bind(at(day, 2 + (k as i64) * 6, rnd(50)))
                 .execute(db)
                 .await?;
                 count += 1;
             }
         }
     }
-    println!("Seeded patient \"Demo cat\" with {count} entries. Log in with demo / demo (local development only!).");
+    println!("Seeded patient \"Demo cat\" with {count} entries over two weeks (today is left for you). Log in with demo / demo (local development only!).");
     Ok(())
 }
 
@@ -456,26 +477,26 @@ mod tests {
         let (_, list) = t.call(&wife, "GET", "/api/patients", None).await;
         assert_eq!(list, json!([{ "id": cat, "name": "Cat", "icon": null, "shared_with": ["me"] }]));
 
-        // My private patient: I can add a symptom and log it.
-        let (st, sym) = t
-            .call(&me, "POST", &format!("/api/patients/{mine}/symptoms"), Some(json!({ "name": "Headache", "kind": "count" })))
+        // My private patient: I can add a tracker and log it.
+        let (st, tracker) = t
+            .call(&me, "POST", &format!("/api/patients/{mine}/trackers"), Some(json!({ "name": "Headache", "kind": "count" })))
             .await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, entry) = t
-            .call(&me, "POST", &format!("/api/patients/{mine}/entries"), Some(json!({ "symptom_id": sym["id"] })))
+            .call(&me, "POST", &format!("/api/patients/{mine}/entries"), Some(json!({ "tracker_id": tracker["id"] })))
             .await;
         assert_eq!(st, StatusCode::CREATED);
         let eid = entry["id"].as_str().unwrap();
 
         // Wife can't see or touch it, not even through the shared patient's routes.
         for (method, uri, body) in [
-            ("GET", format!("/api/patients/{mine}/symptoms"), None),
+            ("GET", format!("/api/patients/{mine}/trackers"), None),
             ("GET", format!("/api/patients/{mine}/entries"), None),
-            ("POST", format!("/api/patients/{mine}/entries"), Some(json!({ "symptom_id": sym["id"] }))),
-            ("POST", format!("/api/patients/{cat}/entries"), Some(json!({ "symptom_id": sym["id"] }))),
+            ("POST", format!("/api/patients/{mine}/entries"), Some(json!({ "tracker_id": tracker["id"] }))),
+            ("POST", format!("/api/patients/{cat}/entries"), Some(json!({ "tracker_id": tracker["id"] }))),
             ("PATCH", format!("/api/patients/{cat}/entries/{eid}"), Some(json!({ "note": "x" }))),
             ("DELETE", format!("/api/patients/{cat}/entries/{eid}"), None),
-            ("PATCH", format!("/api/patients/{cat}/symptoms/{}", sym["id"]), Some(json!({ "name": "x" }))),
+            ("PATCH", format!("/api/patients/{cat}/trackers/{}", tracker["id"]), Some(json!({ "name": "x" }))),
         ] {
             let (st, _) = t.call(&wife, method, &uri, body).await;
             assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}");
@@ -484,10 +505,10 @@ mod tests {
         assert_eq!(mine_entries.as_array().unwrap().len(), 1);
 
         // On the shared cat, entries record who logged them.
-        let (_, cat_syms) = t.call(&wife, "GET", &format!("/api/patients/{cat}/symptoms"), None).await;
+        let (_, cat_syms) = t.call(&wife, "GET", &format!("/api/patients/{cat}/trackers"), None).await;
         let vomited = cat_syms.as_array().unwrap().iter().find(|s| s["name"] == "Vomited").unwrap();
         let (_, e) = t
-            .call(&wife, "POST", &format!("/api/patients/{cat}/entries"), Some(json!({ "symptom_id": vomited["id"] })))
+            .call(&wife, "POST", &format!("/api/patients/{cat}/entries"), Some(json!({ "tracker_id": vomited["id"] })))
             .await;
         assert_eq!(e["logged_by_name"], "wife");
         let (_, seen_by_me) = t.call(&me, "GET", &format!("/api/patients/{cat}/entries"), None).await;
@@ -497,5 +518,63 @@ mod tests {
         patients::unshare(&t.db, cat, "wife").await.unwrap();
         let (st, _) = t.call(&wife, "GET", &format!("/api/patients/{cat}/entries"), None).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn normal_options_and_checkins() {
+        let t = TestApp::new().await;
+        let (me, wife) = (t.user("me").await, t.user("wife").await);
+        let cat = patients::create(&t.db, "Cat", None, patients::Preset::None).await.unwrap();
+        patients::share(&t.db, cat, "me").await.unwrap();
+        let base = format!("/api/patients/{cat}");
+
+        // A new tracker with a normal option.
+        let opts = json!([
+            { "label": "none" }, { "label": "little" }, { "label": "normal", "normal": true }, { "label": "good" }
+        ]);
+        let (st, appetite) = t
+            .call(&me, "POST", &format!("{base}/trackers"), Some(json!({ "name": "Appetite", "kind": "scale", "options": opts })))
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let normal_of = |tracker: &Value| -> Vec<String> {
+            tracker["options"].as_array().unwrap().iter().filter(|o| o["normal"] == true).map(|o| o["label"].as_str().unwrap().to_owned()).collect()
+        };
+        assert_eq!(normal_of(&appetite), ["normal"]);
+
+        // Moving "normal" to another option in one save is fine (the old one is cleared first).
+        let mut options: Vec<Value> = appetite["options"].as_array().unwrap().clone();
+        for o in &mut options {
+            o["normal"] = json!(o["label"] == "good");
+        }
+        let uri = format!("{base}/trackers/{}", appetite["id"]);
+        let (st, moved) = t.call(&me, "PATCH", &uri, Some(json!({ "options": options }))).await;
+        assert_eq!(st, StatusCode::OK, "{moved}");
+        assert_eq!(normal_of(&moved), ["good"]);
+
+        // The normal option can't be retired.
+        let good = options.iter_mut().find(|o| o["label"] == "good").unwrap();
+        good["retired"] = json!(true);
+        let (st, _) = t.call(&me, "PATCH", &uri, Some(json!({ "options": options }))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Check-ins: idempotent like entries, listed with who logged them, private to the patient.
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = json!({ "id": id, "occurred_at": "2026-11-12T09:00:00+01:00" });
+        for _ in 0..2 {
+            let (st, c) = t.call(&me, "POST", &format!("{base}/checkins"), Some(body.clone())).await;
+            assert_eq!(st, StatusCode::CREATED);
+            assert_eq!(c["logged_by_name"], "me");
+            assert_eq!(c["occurred_at"], "2026-11-12T08:00:00.000Z");
+        }
+        let (_, list) = t.call(&me, "GET", &format!("{base}/checkins?from=2026-11-12T00:00:00Z"), None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        let (_, list) = t.call(&me, "GET", &format!("{base}/checkins?from=2026-11-13T00:00:00Z"), None).await;
+        assert_eq!(list.as_array().unwrap().len(), 0);
+        for (method, uri) in [("GET", format!("{base}/checkins")), ("DELETE", format!("{base}/checkins/{id}"))] {
+            let (st, _) = t.call(&wife, method, &uri, None).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+        let (st, _) = t.call(&me, "DELETE", &format!("{base}/checkins/{id}"), None).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
     }
 }

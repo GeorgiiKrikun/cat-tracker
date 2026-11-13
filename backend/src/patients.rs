@@ -89,13 +89,13 @@ pub async fn list(user: CurrentUser, State(st): State<AppState>) -> AppResult<Js
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum Preset {
-    /// No symptoms; add them in the app's Settings.
+    /// No trackers; add them in the app's Settings.
     None,
-    /// Cat starter set: meds, appetite, vomiting, stool, drinking, weight…
+    /// Cat starter set: meds, vomiting, appetite, stool, drinking, weight…
     Cat,
 }
 
-struct PresetSymptom {
+struct PresetTracker {
     name: &'static str,
     kind: &'static str,
     unit: Option<&'static str>,
@@ -103,37 +103,44 @@ struct PresetSymptom {
     pinned: bool,
     /// Scale options worst/least first.
     options: &'static [&'static str],
+    /// The option assumed on observed days without an entry.
+    normal: Option<&'static str>,
 }
 
-const fn sym(
+const fn tracker(
     name: &'static str,
     kind: &'static str,
     icon: &'static str,
     pinned: bool,
     options: &'static [&'static str],
-) -> PresetSymptom {
-    PresetSymptom { name, kind, unit: None, icon, pinned, options }
+) -> PresetTracker {
+    PresetTracker { name, kind, unit: None, icon, pinned, options, normal: None }
 }
 
-const CAT: &[PresetSymptom] = &[
-    sym("Omeprazole", "med", "💊", true, &[]),
-    sym("Emeprid", "med", "💊", true, &[]),
-    sym("Pronefra", "med", "💊", true, &[]),
-    sym("Prednisolone", "med", "💊", true, &[]),
-    sym("Appetite", "scale", "🍽️", true, &["none", "little", "normal", "good"]),
-    sym("Vomited", "count", "🤮", true, &[]),
-    sym("Stool", "choice", "💩", true, &["normal", "soft", "diarrhea", "hard", "with blood"]),
-    sym("Drinking", "scale", "💧", true, &["less", "normal", "more", "a lot"]),
-    sym("Peeing", "scale", "🚽", false, &["less", "normal", "more", "a lot"]),
-    sym("Night waking", "scale", "🌙", true, &["mild", "moderate", "intense"]),
-    sym("Energy", "scale", "⚡", false, &["very low", "low", "normal", "playful"]),
-    PresetSymptom { unit: Some("kg"), ..sym("Weight", "number", "⚖️", false, &[]) },
-    PresetSymptom { unit: Some("mmol/L"), ..sym("Blood glucose", "number", "🩸", false, &[]) },
-    sym("Note", "note", "📝", true, &[]),
+/// A scale/choice where only deviations from `normal` get logged.
+const fn usually(normal: &'static str, t: PresetTracker) -> PresetTracker {
+    PresetTracker { normal: Some(normal), ..t }
+}
+
+const CAT: &[PresetTracker] = &[
+    tracker("Omeprazole", "med", "💊", true, &[]),
+    tracker("Emeprid", "med", "💊", true, &[]),
+    tracker("Pronefra", "med", "💊", true, &[]),
+    tracker("Prednisolone", "med", "💊", true, &[]),
+    tracker("Vomited", "count", "🤮", true, &[]),
+    usually("normal", tracker("Appetite", "scale", "🍽️", true, &["none", "little", "normal", "good"])),
+    usually("normal", tracker("Stool", "choice", "💩", true, &["normal", "soft", "diarrhea", "hard", "with blood"])),
+    usually("normal", tracker("Drinking", "scale", "💧", true, &["less", "normal", "more", "a lot"])),
+    usually("normal", tracker("Peeing", "scale", "🚽", false, &["less", "normal", "more", "a lot"])),
+    usually("none", tracker("Night waking", "scale", "🌙", true, &["none", "mild", "moderate", "intense"])),
+    usually("normal", tracker("Energy", "scale", "⚡", false, &["very low", "low", "normal", "playful"])),
+    PresetTracker { unit: Some("kg"), ..tracker("Weight", "number", "⚖️", false, &[]) },
+    PresetTracker { unit: Some("mmol/L"), ..tracker("Blood glucose", "number", "🩸", false, &[]) },
+    tracker("Note", "note", "📝", true, &[]),
 ];
 
 impl Preset {
-    fn symptoms(self) -> &'static [PresetSymptom] {
+    fn trackers(self) -> &'static [PresetTracker] {
         match self {
             Preset::None => &[],
             Preset::Cat => CAT,
@@ -150,24 +157,25 @@ pub async fn create(db: &SqlitePool, name: &str, icon: Option<&str>, preset: Pre
         .bind(icon)
         .fetch_one(&mut *tx)
         .await?;
-    for (i, s) in preset.symptoms().iter().enumerate() {
-        let sid: i64 = sqlx::query_scalar(
-            "INSERT INTO symptom_types (patient_id, name, kind, unit, icon, pinned, sort_order)
+    for (i, t) in preset.trackers().iter().enumerate() {
+        let tid: i64 = sqlx::query_scalar(
+            "INSERT INTO trackers (patient_id, name, kind, unit, icon, pinned, sort_order)
              VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(pid)
-        .bind(s.name)
-        .bind(s.kind)
-        .bind(s.unit)
-        .bind(s.icon)
-        .bind(s.pinned)
+        .bind(t.name)
+        .bind(t.kind)
+        .bind(t.unit)
+        .bind(t.icon)
+        .bind(t.pinned)
         .bind(i as i64)
         .fetch_one(&mut *tx)
         .await?;
-        for (j, label) in s.options.iter().enumerate() {
-            sqlx::query("INSERT INTO symptom_options (symptom_id, label, sort_order) VALUES (?, ?, ?)")
-                .bind(sid)
+        for (j, label) in t.options.iter().enumerate() {
+            sqlx::query("INSERT INTO tracker_options (tracker_id, label, normal, sort_order) VALUES (?, ?, ?, ?)")
+                .bind(tid)
                 .bind(label)
+                .bind(t.normal == Some(*label))
                 .bind(j as i64)
                 .execute(&mut *tx)
                 .await?;

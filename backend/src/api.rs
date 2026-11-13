@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::StatusCode,
     response::IntoResponse,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
@@ -29,13 +29,14 @@ pub fn router() -> Router<AppState> {
         .route("/me", get(me))
         .route("/patients", get(patients::list))
         // Everything below belongs to one patient; the `Patient` extractor checks access.
-        .route("/patients/{pid}/symptoms", get(list_symptoms).post(create_symptom))
-        .route("/patients/{pid}/symptoms/order", put(reorder_symptoms))
-        .route("/patients/{pid}/symptoms/{id}", patch(update_symptom))
-        .route("/patients/{pid}/symptoms/{id}/options/{option_id}/merge", post(merge_option))
+        .route("/patients/{pid}/trackers", get(list_trackers).post(create_tracker))
+        .route("/patients/{pid}/trackers/order", put(reorder_trackers))
+        .route("/patients/{pid}/trackers/{id}", patch(update_tracker))
+        .route("/patients/{pid}/trackers/{id}/options/{option_id}/merge", post(merge_option))
         .route("/patients/{pid}/entries", get(list_entries).post(create_entry))
         .route("/patients/{pid}/entries/{id}", patch(update_entry).delete(delete_entry))
-        .route("/patients/{pid}/export.csv", get(export_csv))
+        .route("/patients/{pid}/checkins", get(list_checkins).post(create_checkin))
+        .route("/patients/{pid}/checkins/{id}", delete(delete_checkin))
 }
 
 // ---------- auth ----------
@@ -100,7 +101,7 @@ async fn me(user: CurrentUser) -> Json<CurrentUser> {
     Json(user)
 }
 
-// ---------- symptom types ----------
+// ---------- tracker types ----------
 
 pub const KINDS: &[&str] = &["bool", "count", "scale", "choice", "number", "med", "note"];
 
@@ -109,7 +110,7 @@ fn has_options(kind: &str) -> bool {
 }
 
 #[derive(sqlx::FromRow)]
-struct SymptomRow {
+struct TrackerRow {
     id: i64,
     name: String,
     kind: String,
@@ -118,36 +119,41 @@ struct SymptomRow {
     pinned: bool,
     archived: bool,
     sort_order: i64,
+    created_at: String,
 }
 
 #[derive(Serialize, sqlx::FromRow, Clone)]
-struct SymptomOption {
+struct TrackerOption {
     id: i64,
     #[serde(skip)]
-    symptom_id: i64,
+    tracker_id: i64,
     label: String,
     retired: bool,
+    /// The usual state, assumed on observed days without an entry.
+    normal: bool,
     /// Number of entries using this option.
     uses: i64,
 }
 
 #[derive(Serialize)]
-pub struct Symptom {
+pub struct Tracker {
     id: i64,
     name: String,
     kind: String,
     /// In order (scale order for scales), retired ones included.
-    options: Vec<SymptomOption>,
+    options: Vec<TrackerOption>,
     unit: Option<String>,
     icon: Option<String>,
     pinned: bool,
     archived: bool,
     sort_order: i64,
+    /// Normal options aren't assumed for days before this.
+    created_at: String,
 }
 
-impl Symptom {
-    fn new(r: SymptomRow, options: Vec<SymptomOption>) -> Self {
-        Symptom {
+impl Tracker {
+    fn new(r: TrackerRow, options: Vec<TrackerOption>) -> Self {
+        Tracker {
             id: r.id,
             name: r.name,
             kind: r.kind,
@@ -157,15 +163,16 @@ impl Symptom {
             pinned: r.pinned,
             archived: r.archived,
             sort_order: r.sort_order,
+            created_at: r.created_at,
         }
     }
 }
 
-/// A symptom of this patient (404 for other patients' symptoms).
-async fn fetch_symptom(st: &AppState, pid: i64, id: i64) -> AppResult<SymptomRow> {
+/// A tracker of this patient (404 for other patients' trackers).
+async fn fetch_tracker(st: &AppState, pid: i64, id: i64) -> AppResult<TrackerRow> {
     sqlx::query_as(
-        "SELECT id, name, kind, unit, icon, pinned, archived, sort_order
-           FROM symptom_types WHERE id = ? AND patient_id = ?",
+        "SELECT id, name, kind, unit, icon, pinned, archived, sort_order, created_at
+           FROM trackers WHERE id = ? AND patient_id = ?",
     )
     .bind(id)
     .bind(pid)
@@ -174,41 +181,41 @@ async fn fetch_symptom(st: &AppState, pid: i64, id: i64) -> AppResult<SymptomRow
     .ok_or(AppError::NotFound)
 }
 
-/// Options of one symptom, or of all the patient's symptoms when `symptom_id` is None.
-async fn fetch_options(st: &AppState, pid: i64, symptom_id: Option<i64>) -> AppResult<Vec<SymptomOption>> {
+/// Options of one tracker, or of all the patient's trackers when `tracker_id` is None.
+async fn fetch_options(st: &AppState, pid: i64, tracker_id: Option<i64>) -> AppResult<Vec<TrackerOption>> {
     Ok(sqlx::query_as(
-        "SELECT o.id, o.symptom_id, o.label, o.retired,
+        "SELECT o.id, o.tracker_id, o.label, o.retired, o.normal,
                 (SELECT COUNT(*) FROM entries e WHERE e.option_id = o.id) AS uses
-           FROM symptom_options o
-           JOIN symptom_types s ON s.id = o.symptom_id
-          WHERE s.patient_id = ?1 AND (?2 IS NULL OR o.symptom_id = ?2)
-          ORDER BY o.symptom_id, o.sort_order, o.id",
+           FROM tracker_options o
+           JOIN trackers t ON t.id = o.tracker_id
+          WHERE t.patient_id = ?1 AND (?2 IS NULL OR o.tracker_id = ?2)
+          ORDER BY o.tracker_id, o.sort_order, o.id",
     )
     .bind(pid)
-    .bind(symptom_id)
+    .bind(tracker_id)
     .fetch_all(&st.db)
     .await?)
 }
 
-async fn symptom_with_options(st: &AppState, pid: i64, id: i64) -> AppResult<Symptom> {
-    let row = fetch_symptom(st, pid, id).await?;
-    Ok(Symptom::new(row, fetch_options(st, pid, Some(id)).await?))
+async fn tracker_with_options(st: &AppState, pid: i64, id: i64) -> AppResult<Tracker> {
+    let row = fetch_tracker(st, pid, id).await?;
+    Ok(Tracker::new(row, fetch_options(st, pid, Some(id)).await?))
 }
 
 #[derive(Deserialize)]
-struct ListSymptomsQ {
+struct ListTrackersQ {
     #[serde(default)]
     include_archived: bool,
 }
 
-async fn list_symptoms(
+async fn list_trackers(
     p: Patient,
     State(st): State<AppState>,
-    Query(q): Query<ListSymptomsQ>,
-) -> AppResult<Json<Vec<Symptom>>> {
-    let rows: Vec<SymptomRow> = sqlx::query_as(
-        "SELECT id, name, kind, unit, icon, pinned, archived, sort_order
-           FROM symptom_types
+    Query(q): Query<ListTrackersQ>,
+) -> AppResult<Json<Vec<Tracker>>> {
+    let rows: Vec<TrackerRow> = sqlx::query_as(
+        "SELECT id, name, kind, unit, icon, pinned, archived, sort_order, created_at
+           FROM trackers
           WHERE patient_id = ? AND (? OR archived = 0)
           ORDER BY sort_order, id",
     )
@@ -216,15 +223,15 @@ async fn list_symptoms(
     .bind(q.include_archived)
     .fetch_all(&st.db)
     .await?;
-    let mut by_symptom: HashMap<i64, Vec<SymptomOption>> = HashMap::new();
+    let mut by_tracker: HashMap<i64, Vec<TrackerOption>> = HashMap::new();
     for o in fetch_options(&st, p.id, None).await? {
-        by_symptom.entry(o.symptom_id).or_default().push(o);
+        by_tracker.entry(o.tracker_id).or_default().push(o);
     }
     Ok(Json(
         rows.into_iter()
             .map(|r| {
-                let opts = by_symptom.remove(&r.id).unwrap_or_default();
-                Symptom::new(r, opts)
+                let opts = by_tracker.remove(&r.id).unwrap_or_default();
+                Tracker::new(r, opts)
             })
             .collect(),
     ))
@@ -237,10 +244,12 @@ struct OptionInput {
     label: String,
     #[serde(default)]
     retired: bool,
+    #[serde(default)]
+    normal: bool,
 }
 
 #[derive(Deserialize)]
-struct SymptomInput {
+struct TrackerInput {
     name: Option<String>,
     kind: Option<String>,
     /// The full option list, in order. Existing options left out are deleted,
@@ -257,8 +266,9 @@ fn clean_opt_text(v: Option<String>) -> Option<String> {
 }
 
 /// Check an option list before saving: non-empty unique labels, ids that
-/// belong to this symptom, at least two options left to log with.
-fn check_options(inp: &mut [OptionInput], existing: &[SymptomOption]) -> AppResult<()> {
+/// belong to this tracker, at least two options left to log with, at most
+/// one normal option and not a retired one.
+fn check_options(inp: &mut [OptionInput], existing: &[TrackerOption]) -> AppResult<()> {
     let bad = |m: String| Err(AppError::BadRequest(m));
     let mut seen = std::collections::HashSet::new();
     for o in inp.iter_mut() {
@@ -269,11 +279,17 @@ fn check_options(inp: &mut [OptionInput], existing: &[SymptomOption]) -> AppResu
         if let Some(id) = o.id
             && !existing.iter().any(|e| e.id == id)
         {
-            return bad(format!("option {id} doesn't belong to this symptom"));
+            return bad(format!("option {id} doesn't belong to this tracker"));
         }
         if !seen.insert(o.label.to_lowercase()) {
             return bad(format!("“{}” is listed twice", o.label));
         }
+        if o.normal && o.retired {
+            return bad(format!("“{}” is retired, so it can't be the normal option", o.label));
+        }
+    }
+    if inp.iter().filter(|o| o.normal).count() > 1 {
+        return bad("only one option can be the normal one".into());
     }
     if inp.iter().filter(|o| !o.retired).count() < 2 {
         return bad("scale and choice need at least two active options".into());
@@ -281,12 +297,12 @@ fn check_options(inp: &mut [OptionInput], existing: &[SymptomOption]) -> AppResu
     Ok(())
 }
 
-/// Write an already checked option list for a symptom (inside a transaction).
+/// Write an already checked option list for a tracker (inside a transaction).
 async fn save_options(
     tx: &mut sqlx::SqliteConnection,
-    symptom_id: i64,
+    tracker_id: i64,
     inp: &[OptionInput],
-    existing: &[SymptomOption],
+    existing: &[TrackerOption],
 ) -> AppResult<()> {
     for e in existing {
         if inp.iter().any(|o| o.id == Some(e.id)) {
@@ -298,19 +314,25 @@ async fn save_options(
                 e.label, e.uses
             )));
         }
-        sqlx::query("DELETE FROM symptom_options WHERE id = ?")
+        sqlx::query("DELETE FROM tracker_options WHERE id = ?")
             .bind(e.id)
             .execute(&mut *tx)
             .await?;
     }
+    // Cleared first: the unique index allows one normal option at any moment.
+    sqlx::query("UPDATE tracker_options SET normal = 0 WHERE tracker_id = ?")
+        .bind(tracker_id)
+        .execute(&mut *tx)
+        .await?;
     for (i, o) in inp.iter().enumerate() {
         match o.id {
             Some(id) => {
                 sqlx::query(
-                    "UPDATE symptom_options SET label = ?, retired = ?, sort_order = ? WHERE id = ?",
+                    "UPDATE tracker_options SET label = ?, retired = ?, normal = ?, sort_order = ? WHERE id = ?",
                 )
                 .bind(&o.label)
                 .bind(o.retired)
+                .bind(o.normal)
                 .bind(i as i64)
                 .bind(id)
                 .execute(&mut *tx)
@@ -318,12 +340,13 @@ async fn save_options(
             }
             None => {
                 sqlx::query(
-                    "INSERT INTO symptom_options (symptom_id, label, retired, sort_order)
-                     VALUES (?, ?, ?, ?)",
+                    "INSERT INTO tracker_options (tracker_id, label, retired, normal, sort_order)
+                     VALUES (?, ?, ?, ?, ?)",
                 )
-                .bind(symptom_id)
+                .bind(tracker_id)
                 .bind(&o.label)
                 .bind(o.retired)
+                .bind(o.normal)
                 .bind(i as i64)
                 .execute(&mut *tx)
                 .await?;
@@ -333,11 +356,11 @@ async fn save_options(
     Ok(())
 }
 
-async fn create_symptom(
+async fn create_tracker(
     p: Patient,
     State(st): State<AppState>,
-    Json(inp): Json<SymptomInput>,
-) -> AppResult<(StatusCode, Json<Symptom>)> {
+    Json(inp): Json<TrackerInput>,
+) -> AppResult<(StatusCode, Json<Tracker>)> {
     let name = clean_opt_text(inp.name).ok_or(AppError::BadRequest("name is required".into()))?;
     let kind = inp.kind.unwrap_or_default();
     if !KINDS.contains(&kind.as_str()) {
@@ -346,19 +369,19 @@ async fn create_symptom(
     let mut options = inp.options.unwrap_or_default();
     if has_options(&kind) {
         if options.iter().any(|o| o.id.is_some()) {
-            return Err(AppError::BadRequest("a new symptom has no existing options".into()));
+            return Err(AppError::BadRequest("a new tracker has no existing options".into()));
         }
         check_options(&mut options, &[])?;
     }
     let mut tx = st.db.begin().await?;
     let next_order: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM symptom_types WHERE patient_id = ?",
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM trackers WHERE patient_id = ?",
     )
     .bind(p.id)
     .fetch_one(&mut *tx)
     .await?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO symptom_types (patient_id, name, kind, unit, icon, pinned, sort_order)
+        "INSERT INTO trackers (patient_id, name, kind, unit, icon, pinned, sort_order)
          VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(p.id)
@@ -374,20 +397,20 @@ async fn create_symptom(
         save_options(&mut tx, id, &options, &[]).await?;
     }
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(symptom_with_options(&st, p.id, id).await?)))
+    Ok((StatusCode::CREATED, Json(tracker_with_options(&st, p.id, id).await?)))
 }
 
-async fn update_symptom(
+async fn update_tracker(
     p: Patient,
     State(st): State<AppState>,
     Path((_, id)): Path<(i64, i64)>,
-    Json(inp): Json<SymptomInput>,
-) -> AppResult<Json<Symptom>> {
-    let cur = fetch_symptom(&st, p.id, id).await?;
+    Json(inp): Json<TrackerInput>,
+) -> AppResult<Json<Tracker>> {
+    let cur = fetch_tracker(&st, p.id, id).await?;
     if inp.kind.as_deref().is_some_and(|k| k != cur.kind) {
         // Changing the kind would make old entries meaningless.
         return Err(AppError::BadRequest(
-            "kind can't be changed; archive this one and create a new symptom".into(),
+            "kind can't be changed; archive this one and create a new tracker".into(),
         ));
     }
     let name = match inp.name {
@@ -410,7 +433,7 @@ async fn update_symptom(
 
     let mut tx = st.db.begin().await?;
     sqlx::query(
-        "UPDATE symptom_types
+        "UPDATE trackers
             SET name = ?, unit = ?, icon = ?, pinned = ?, archived = ?
           WHERE id = ?",
     )
@@ -426,7 +449,7 @@ async fn update_symptom(
         save_options(&mut tx, id, &o, &existing).await?;
     }
     tx.commit().await?;
-    Ok(Json(symptom_with_options(&st, p.id, id).await?))
+    Ok(Json(tracker_with_options(&st, p.id, id).await?))
 }
 
 #[derive(Deserialize)]
@@ -434,15 +457,15 @@ struct MergeInput {
     into: i64,
 }
 
-/// Move all entries of one option to another option of the same symptom,
+/// Move all entries of one option to another option of the same tracker,
 /// then delete the now unused option. The only operation that rewrites history.
 async fn merge_option(
     p: Patient,
     State(st): State<AppState>,
-    Path((_, symptom_id, from)): Path<(i64, i64, i64)>,
+    Path((_, tracker_id, from)): Path<(i64, i64, i64)>,
     Json(inp): Json<MergeInput>,
-) -> AppResult<Json<Symptom>> {
-    let existing = fetch_options(&st, p.id, Some(symptom_id)).await?;
+) -> AppResult<Json<Tracker>> {
+    let existing = fetch_options(&st, p.id, Some(tracker_id)).await?;
     let belongs = |id| existing.iter().any(|o| o.id == id);
     if !belongs(from) || !belongs(inp.into) {
         return Err(AppError::NotFound);
@@ -456,22 +479,29 @@ async fn merge_option(
         .bind(from)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM symptom_options WHERE id = ?")
+    sqlx::query("DELETE FROM tracker_options WHERE id = ?")
         .bind(from)
         .execute(&mut *tx)
         .await?;
+    if existing.iter().any(|o| o.id == from && o.normal) {
+        // Merging the normal option: the one it became is the normal one now.
+        sqlx::query("UPDATE tracker_options SET normal = 1 WHERE id = ? AND NOT retired")
+            .bind(inp.into)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
-    Ok(Json(symptom_with_options(&st, p.id, symptom_id).await?))
+    Ok(Json(tracker_with_options(&st, p.id, tracker_id).await?))
 }
 
-async fn reorder_symptoms(
+async fn reorder_trackers(
     p: Patient,
     State(st): State<AppState>,
     Json(ids): Json<Vec<i64>>,
 ) -> AppResult<StatusCode> {
     let mut tx = st.db.begin().await?;
     for (i, id) in ids.iter().enumerate() {
-        sqlx::query("UPDATE symptom_types SET sort_order = ? WHERE id = ? AND patient_id = ?")
+        sqlx::query("UPDATE trackers SET sort_order = ? WHERE id = ? AND patient_id = ?")
             .bind(i as i64)
             .bind(id)
             .bind(p.id)
@@ -487,8 +517,8 @@ async fn reorder_symptoms(
 #[derive(Serialize, sqlx::FromRow)]
 struct Entry {
     id: String,
-    symptom_id: i64,
-    symptom_name: String,
+    tracker_id: i64,
+    tracker_name: String,
     kind: String,
     /// Set for scale/choice entries; `value` then carries the option's label.
     option_id: Option<i64>,
@@ -504,7 +534,7 @@ struct Entry {
 struct ListEntriesQ {
     from: Option<String>,
     to: Option<String>,
-    symptom_id: Option<i64>,
+    tracker_id: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -513,23 +543,23 @@ async fn query_entries(st: &AppState, pid: i64, q: &ListEntriesQ) -> AppResult<V
     let to = q.to.as_deref().map(normalize_ts).transpose()?;
     let limit = q.limit.unwrap_or(2000).clamp(1, 10_000);
     let rows = sqlx::query_as(
-        "SELECT e.id, e.symptom_id, s.name AS symptom_name, s.kind, e.option_id,
+        "SELECT e.id, e.tracker_id, t.name AS tracker_name, t.kind, e.option_id,
                 COALESCE(o.label, e.value) AS value, e.note,
                 e.logged_by, u.display_name AS logged_by_name, e.occurred_at, e.created_at
            FROM entries e
-           JOIN symptom_types s ON s.id = e.symptom_id
-           LEFT JOIN symptom_options o ON o.id = e.option_id
+           JOIN trackers t ON t.id = e.tracker_id
+           LEFT JOIN tracker_options o ON o.id = e.option_id
            LEFT JOIN users u ON u.id = e.logged_by
-          WHERE s.patient_id = ?5
+          WHERE t.patient_id = ?5
             AND (?1 IS NULL OR e.occurred_at >= ?1)
             AND (?2 IS NULL OR e.occurred_at <  ?2)
-            AND (?3 IS NULL OR e.symptom_id = ?3)
+            AND (?3 IS NULL OR e.tracker_id = ?3)
           ORDER BY e.occurred_at DESC
           LIMIT ?4",
     )
     .bind(from)
     .bind(to)
-    .bind(q.symptom_id)
+    .bind(q.tracker_id)
     .bind(limit)
     .bind(pid)
     .fetch_all(&st.db)
@@ -548,14 +578,14 @@ async fn list_entries(
 /// An entry of this patient (404 for other patients' entries).
 async fn fetch_entry(st: &AppState, pid: i64, id: &str) -> AppResult<Entry> {
     sqlx::query_as(
-        "SELECT e.id, e.symptom_id, s.name AS symptom_name, s.kind, e.option_id,
+        "SELECT e.id, e.tracker_id, t.name AS tracker_name, t.kind, e.option_id,
                 COALESCE(o.label, e.value) AS value, e.note,
                 e.logged_by, u.display_name AS logged_by_name, e.occurred_at, e.created_at
            FROM entries e
-           JOIN symptom_types s ON s.id = e.symptom_id
-           LEFT JOIN symptom_options o ON o.id = e.option_id
+           JOIN trackers t ON t.id = e.tracker_id
+           LEFT JOIN tracker_options o ON o.id = e.option_id
            LEFT JOIN users u ON u.id = e.logged_by
-          WHERE e.id = ? AND s.patient_id = ?",
+          WHERE e.id = ? AND t.patient_id = ?",
     )
     .bind(id)
     .bind(pid)
@@ -571,20 +601,20 @@ struct EntryValue {
     option_id: Option<i64>,
 }
 
-/// Check and normalise a value against its symptom's kind. `options` are the
-/// symptom's options; retired ones are accepted too, so an entry queued
+/// Check and normalise a value against its tracker's kind. `options` are the
+/// tracker's options; retired ones are accepted too, so an entry queued
 /// offline still saves if its option was retired in the meantime.
 fn validate_value(
-    sym: &SymptomRow,
-    options: &[SymptomOption],
+    tracker: &TrackerRow,
+    options: &[TrackerOption],
     value: Option<String>,
     option_id: Option<i64>,
     note: &Option<String>,
 ) -> AppResult<EntryValue> {
     let value = clean_opt_text(value);
-    let bad = |m: &str| Err(AppError::BadRequest(format!("{}: {m}", sym.name)));
+    let bad = |m: &str| Err(AppError::BadRequest(format!("{}: {m}", tracker.name)));
     let plain = |v: &str| Ok(EntryValue { value: Some(v.to_string()), option_id: None });
-    match sym.kind.as_str() {
+    match tracker.kind.as_str() {
         "bool" => plain("yes"),
         "count" => match value {
             None => plain("1"),
@@ -603,7 +633,7 @@ fn validate_value(
             Some(Ok(n)) if n.is_finite() => plain(&n.to_string()),
             _ => bad("enter a number"),
         },
-        "med" => plain(&value.or_else(|| sym.unit.clone()).unwrap_or("given".into())),
+        "med" => plain(&value.or_else(|| tracker.unit.clone()).unwrap_or("given".into())),
         "note" => {
             if note.as_deref().is_none_or(|n| n.trim().is_empty()) {
                 bad("note can't be empty")
@@ -615,10 +645,20 @@ fn validate_value(
     }
 }
 
+/// The id a client generated for something it may re-send, or a new one.
+fn parse_client_id(id: Option<String>) -> AppResult<String> {
+    match id {
+        Some(id) => Ok(uuid::Uuid::parse_str(&id)
+            .map_err(|_| AppError::BadRequest("id must be a UUID".into()))?
+            .to_string()),
+        None => Ok(uuid::Uuid::new_v4().to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 struct EntryInput {
     id: Option<String>,
-    symptom_id: i64,
+    tracker_id: i64,
     value: Option<String>,
     option_id: Option<i64>,
     note: Option<String>,
@@ -630,27 +670,22 @@ async fn create_entry(
     State(st): State<AppState>,
     Json(inp): Json<EntryInput>,
 ) -> AppResult<(StatusCode, Json<Entry>)> {
-    let sym = fetch_symptom(&st, p.id, inp.symptom_id).await?;
-    let options = fetch_options(&st, p.id, Some(sym.id)).await?;
+    let tracker = fetch_tracker(&st, p.id, inp.tracker_id).await?;
+    let options = fetch_options(&st, p.id, Some(tracker.id)).await?;
     let note = clean_opt_text(inp.note);
-    let v = validate_value(&sym, &options, inp.value, inp.option_id, &note)?;
+    let v = validate_value(&tracker, &options, inp.value, inp.option_id, &note)?;
     let occurred_at = match inp.occurred_at.as_deref() {
         Some(t) => normalize_ts(t)?,
         None => now_ts(),
     };
-    let id = match inp.id {
-        Some(id) => uuid::Uuid::parse_str(&id)
-            .map_err(|_| AppError::BadRequest("id must be a UUID".into()))?
-            .to_string(),
-        None => uuid::Uuid::new_v4().to_string(),
-    };
+    let id = parse_client_id(inp.id)?;
     // Idempotent: re-sending a queued offline entry is a no-op.
     sqlx::query(
-        "INSERT OR IGNORE INTO entries (id, symptom_id, option_id, value, note, logged_by, occurred_at)
+        "INSERT OR IGNORE INTO entries (id, tracker_id, option_id, value, note, logged_by, occurred_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(sym.id)
+    .bind(tracker.id)
     .bind(v.option_id)
     .bind(v.value)
     .bind(note)
@@ -676,17 +711,17 @@ async fn update_entry(
     Json(p): Json<EntryPatch>,
 ) -> AppResult<Json<Entry>> {
     let cur = fetch_entry(&st, pat.id, &id).await?;
-    let sym = fetch_symptom(&st, pat.id, cur.symptom_id).await?;
-    let options = fetch_options(&st, pat.id, Some(sym.id)).await?;
+    let tracker = fetch_tracker(&st, pat.id, cur.tracker_id).await?;
+    let options = fetch_options(&st, pat.id, Some(tracker.id)).await?;
     let note = match p.note {
         Some(n) => clean_opt_text(n),
         None => cur.note,
     };
     // For option entries cur.value is the label, so only fall back to it otherwise.
-    let v = if has_options(&sym.kind) {
-        validate_value(&sym, &options, None, p.option_id.or(cur.option_id), &note)?
+    let v = if has_options(&tracker.kind) {
+        validate_value(&tracker, &options, None, p.option_id.or(cur.option_id), &note)?
     } else {
-        validate_value(&sym, &options, p.value.or(cur.value), None, &note)?
+        validate_value(&tracker, &options, p.value.or(cur.value), None, &note)?
     };
     let occurred_at = match p.occurred_at.as_deref() {
         Some(t) => normalize_ts(t)?,
@@ -710,7 +745,7 @@ async fn delete_entry(
 ) -> AppResult<StatusCode> {
     let res = sqlx::query(
         "DELETE FROM entries
-          WHERE id = ? AND symptom_id IN (SELECT id FROM symptom_types WHERE patient_id = ?)",
+          WHERE id = ? AND tracker_id IN (SELECT id FROM trackers WHERE patient_id = ?)",
     )
     .bind(&id)
     .bind(p.id)
@@ -722,55 +757,108 @@ async fn delete_entry(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---------- export ----------
+// ---------- check-ins ----------
 
-fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
+/// "Nothing unusual today": the day was observed, so normal options apply.
+#[derive(Serialize, sqlx::FromRow)]
+struct Checkin {
+    id: String,
+    logged_by: Option<i64>,
+    logged_by_name: Option<String>,
+    occurred_at: String,
+    created_at: String,
 }
 
-async fn export_csv(
+#[derive(Deserialize)]
+struct ListCheckinsQ {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+async fn list_checkins(
     p: Patient,
     State(st): State<AppState>,
-    Query(q): Query<ListEntriesQ>,
-) -> AppResult<impl IntoResponse> {
-    let q = ListEntriesQ {
-        limit: Some(q.limit.unwrap_or(10_000)),
-        ..q
-    };
-    let rows = query_entries(&st, p.id, &q).await?;
-    let mut out = String::from("occurred_at,symptom,value,note,logged_by\n");
-    for e in rows.iter().rev() {
-        out.push_str(&format!(
-            "{},{},{},{},{}\n",
-            e.occurred_at,
-            csv_field(&e.symptom_name),
-            csv_field(e.value.as_deref().unwrap_or("")),
-            csv_field(e.note.as_deref().unwrap_or("")),
-            csv_field(e.logged_by_name.as_deref().unwrap_or("")),
-        ));
-    }
-    Ok((
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"cat-tracker-export.csv\"",
-            ),
-        ],
-        out,
+    Query(q): Query<ListCheckinsQ>,
+) -> AppResult<Json<Vec<Checkin>>> {
+    let from = q.from.as_deref().map(normalize_ts).transpose()?;
+    let to = q.to.as_deref().map(normalize_ts).transpose()?;
+    Ok(Json(
+        sqlx::query_as(
+            "SELECT c.id, c.logged_by, u.display_name AS logged_by_name, c.occurred_at, c.created_at
+               FROM checkins c LEFT JOIN users u ON u.id = c.logged_by
+              WHERE c.patient_id = ?1
+                AND (?2 IS NULL OR c.occurred_at >= ?2)
+                AND (?3 IS NULL OR c.occurred_at <  ?3)
+              ORDER BY c.occurred_at DESC
+              LIMIT 2000",
+        )
+        .bind(p.id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&st.db)
+        .await?,
     ))
+}
+
+#[derive(Deserialize)]
+struct CheckinInput {
+    id: Option<String>,
+    occurred_at: Option<String>,
+}
+
+async fn create_checkin(
+    p: Patient,
+    State(st): State<AppState>,
+    Json(inp): Json<CheckinInput>,
+) -> AppResult<(StatusCode, Json<Checkin>)> {
+    let id = parse_client_id(inp.id)?;
+    let occurred_at = match inp.occurred_at.as_deref() {
+        Some(t) => normalize_ts(t)?,
+        None => now_ts(),
+    };
+    // Idempotent like entries, for the offline queue.
+    sqlx::query("INSERT OR IGNORE INTO checkins (id, patient_id, logged_by, occurred_at) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(p.id)
+        .bind(p.user.id)
+        .bind(occurred_at)
+        .execute(&st.db)
+        .await?;
+    let saved = sqlx::query_as(
+        "SELECT c.id, c.logged_by, u.display_name AS logged_by_name, c.occurred_at, c.created_at
+           FROM checkins c LEFT JOIN users u ON u.id = c.logged_by
+          WHERE c.id = ? AND c.patient_id = ?",
+    )
+        .bind(&id)
+        .bind(p.id)
+        .fetch_optional(&st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok((StatusCode::CREATED, Json(saved)))
+}
+
+async fn delete_checkin(
+    p: Patient,
+    State(st): State<AppState>,
+    Path((_, id)): Path<(i64, String)>,
+) -> AppResult<StatusCode> {
+    let res = sqlx::query("DELETE FROM checkins WHERE id = ? AND patient_id = ?")
+        .bind(&id)
+        .bind(p.id)
+        .execute(&st.db)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sym(kind: &str, unit: Option<&str>) -> SymptomRow {
-        SymptomRow {
+    fn tracker(kind: &str, unit: Option<&str>) -> TrackerRow {
+        TrackerRow {
             id: 1,
             name: "X".into(),
             kind: kind.into(),
@@ -779,37 +867,38 @@ mod tests {
             pinned: false,
             archived: false,
             sort_order: 0,
+            created_at: String::new(),
         }
     }
 
-    fn opt(id: i64, label: &str, retired: bool, uses: i64) -> SymptomOption {
-        SymptomOption { id, symptom_id: 1, label: label.into(), retired, uses }
+    fn opt(id: i64, label: &str, retired: bool, uses: i64) -> TrackerOption {
+        TrackerOption { id, tracker_id: 1, label: label.into(), retired, normal: false, uses }
     }
 
     fn input(id: Option<i64>, label: &str, retired: bool) -> OptionInput {
-        OptionInput { id, label: label.into(), retired }
+        OptionInput { id, label: label.into(), retired, normal: false }
     }
 
     #[test]
     fn validates_values_by_kind() {
         let none = None;
         let val = |v: &str| EntryValue { value: Some(v.into()), option_id: None };
-        assert_eq!(validate_value(&sym("bool", None), &[], None, None, &none).unwrap(), val("yes"));
-        assert_eq!(validate_value(&sym("count", None), &[], None, None, &none).unwrap(), val("1"));
-        assert!(validate_value(&sym("count", None), &[], Some("0".into()), None, &none).is_err());
-        let num = sym("number", Some("kg"));
+        assert_eq!(validate_value(&tracker("bool", None), &[], None, None, &none).unwrap(), val("yes"));
+        assert_eq!(validate_value(&tracker("count", None), &[], None, None, &none).unwrap(), val("1"));
+        assert!(validate_value(&tracker("count", None), &[], Some("0".into()), None, &none).is_err());
+        let num = tracker("number", Some("kg"));
         assert_eq!(validate_value(&num, &[], Some("4,25".into()), None, &none).unwrap(), val("4.25"));
         assert!(validate_value(&num, &[], Some("abc".into()), None, &none).is_err());
-        let med = sym("med", Some("1/4 tab"));
+        let med = tracker("med", Some("1/4 tab"));
         assert_eq!(validate_value(&med, &[], None, None, &none).unwrap(), val("1/4 tab"));
-        assert!(validate_value(&sym("note", None), &[], None, None, &none).is_err());
-        assert!(validate_value(&sym("note", None), &[], None, None, &Some("ok".into())).is_ok());
+        assert!(validate_value(&tracker("note", None), &[], None, None, &none).is_err());
+        assert!(validate_value(&tracker("note", None), &[], None, None, &Some("ok".into())).is_ok());
     }
 
     #[test]
-    fn option_entries_need_one_of_the_symptoms_options() {
+    fn option_entries_need_one_of_the_trackers_options() {
         let none = None;
-        let scale = sym("scale", None);
+        let scale = tracker("scale", None);
         let opts = [opt(10, "little", false, 0), opt(11, "soft", true, 3)];
         let picked = validate_value(&scale, &opts, None, Some(10), &none).unwrap();
         assert_eq!(picked, EntryValue { value: None, option_id: Some(10) });
@@ -838,12 +927,18 @@ mod tests {
         assert!(check_options(&mut foreign, &existing).is_err());
         let mut empty = vec![input(Some(1), "  ", false), input(None, "y", false)];
         assert!(check_options(&mut empty, &existing).is_err());
+
+        let normal = |o: OptionInput| OptionInput { normal: true, ..o };
+        let mut one_normal = vec![normal(input(Some(1), "soft", false)), input(Some(2), "hard", false)];
+        assert!(check_options(&mut one_normal, &existing).is_ok());
+        let mut two_normal = vec![normal(input(Some(1), "soft", false)), normal(input(Some(2), "hard", false))];
+        assert!(check_options(&mut two_normal, &existing).is_err());
+        let mut retired_normal = vec![
+            normal(input(Some(1), "soft", true)),
+            input(Some(2), "hard", false),
+            input(None, "stone", false),
+        ];
+        assert!(check_options(&mut retired_normal, &existing).is_err());
     }
 
-    #[test]
-    fn csv_escaping() {
-        assert_eq!(csv_field("plain"), "plain");
-        assert_eq!(csv_field("a,b"), "\"a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-    }
 }

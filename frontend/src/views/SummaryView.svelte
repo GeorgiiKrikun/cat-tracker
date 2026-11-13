@@ -1,14 +1,16 @@
 <script lang="ts">
-  import { api, type Entry, type Symptom, type SymptomOption } from '../lib/api';
+  import { api, normalOption, type Checkin, type Entry, type Tracker, type TrackerOption } from '../lib/api';
+  import { assumedDays, observedDays, summaryCsv } from '../lib/days';
   import { store } from '../lib/store.svelte';
   import { clock, dayKey, dayLabel, lastDays, shortDay, startOfDay } from '../lib/time';
 
   let range = $state(14);
   let entries = $state<Entry[]>([]);
-  let symptoms = $state<Symptom[]>([]);
+  let checkins = $state<Checkin[]>([]);
+  let trackers = $state<Tracker[]>([]);
   let loading = $state(true);
   let error = $state('');
-  /** Tapped mark info per symptom id (tooltips don't exist on touch screens). */
+  /** Tapped mark info per tracker id (tooltips don't exist on touch screens). */
   let tips = $state<Record<number, string>>({});
 
   $effect(() => {
@@ -18,35 +20,43 @@
     if (pid === null) return;
     loading = true;
     error = '';
-    Promise.all([api.symptoms(pid, true), api.entries(pid, { from: startOfDay(r - 1).toISOString(), limit: 10000 })])
-      .then(([s, e]) => {
-        symptoms = s;
+    const from = startOfDay(r - 1).toISOString();
+    Promise.all([api.trackers(pid, true), api.entries(pid, { from, limit: 10000 }), api.checkins(pid, { from })])
+      .then(([t, e, c]) => {
+        trackers = t;
         entries = e;
+        checkins = c;
       })
       .catch((e) => (error = store.online ? String(e.message ?? e) : 'Offline — the summary needs a connection.'))
       .finally(() => (loading = false));
   });
 
   const days = $derived(lastDays(range));
+  /** Days someone logged anything; the others are shaded as "nobody looked". */
+  const observed = $derived(observedDays(entries, checkins));
 
   interface Row {
-    sym: Symptom;
+    tracker: Tracker;
     list: Entry[];
     byDay: Map<string, Entry[]>;
+    normal: TrackerOption | undefined;
+    /** Days where nothing was logged and the normal option is assumed. */
+    assumed: Set<string>;
   }
 
   const rows = $derived.by(() => {
     const out: Row[] = [];
-    for (const sym of symptoms) {
-      const list = entries.filter((e) => e.symptom_id === sym.id);
-      if (list.length === 0 && (sym.archived || sym.kind === 'note')) continue;
+    for (const tracker of trackers) {
+      const list = entries.filter((e) => e.tracker_id === tracker.id);
       const byDay = new Map<string, Entry[]>();
       for (const e of list) {
         const k = dayKey(e.occurred_at);
         if (!byDay.has(k)) byDay.set(k, []);
         byDay.get(k)!.push(e);
       }
-      out.push({ sym, list, byDay });
+      const assumed = new Set(assumedDays(tracker, days, observed, new Set(byDay.keys())));
+      if (list.length === 0 && !assumed.size && (tracker.archived || tracker.kind === 'note')) continue;
+      out.push({ tracker, list, byDay, normal: normalOption(tracker), assumed });
     }
     return out;
   });
@@ -65,8 +75,13 @@
   function dayTotal(list: Entry[] | undefined): number {
     return (list ?? []).reduce((a, e) => a + countOf(e), 0);
   }
-  function describe(day: string, list: Entry[] | undefined, unit?: string | null): string {
-    if (!list?.length) return `${dayLabel(day)}: nothing logged`;
+  function describe(day: string, list: Entry[] | undefined, row: Row): string {
+    const unit = row.tracker.unit;
+    if (!list?.length) {
+      if (!observed.has(day)) return `${dayLabel(day)}: nobody logged anything this day`;
+      if (row.assumed.has(day)) return `${dayLabel(day)}: nothing logged, so ${row.normal!.label}`;
+      return `${dayLabel(day)}: nothing logged`;
+    }
     const parts = list
       .slice()
       .reverse()
@@ -74,18 +89,23 @@
     return `${dayLabel(day)}: ${parts.join(', ')}`;
   }
   /** Chart rows: active options (best on top for scales), then retired ones that have data in this period. */
-  function chartOptions(sym: Symptom, list: Entry[]): SymptomOption[] {
+  function chartOptions(tracker: Tracker, list: Entry[]): TrackerOption[] {
     const used = new Set(list.map((e) => e.option_id));
-    const active = sym.options.filter((o) => !o.retired);
-    const retired = sym.options.filter((o) => o.retired && used.has(o.id));
-    return [...(sym.kind === 'scale' ? active.reverse() : active), ...retired];
+    const active = tracker.options.filter((o) => !o.retired);
+    const retired = tracker.options.filter((o) => o.retired && used.has(o.id));
+    return [...(tracker.kind === 'scale' ? active.reverse() : active), ...retired];
   }
   function tip(id: number, text: string) {
     tips = { ...tips, [id]: text };
   }
 
-  function exportUrl() {
-    return store.patientId === null ? '' : api.exportUrl(store.patientId, startOfDay(range - 1).toISOString());
+  function exportCsv() {
+    const csv = summaryCsv(days, trackers, entries, checkins);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    a.download = `${store.patient?.name ?? 'tracker'} ${days[0]} – ${days[days.length - 1]}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
   // Tick labels: first, last and every ~7th day.
@@ -101,12 +121,18 @@
 </div>
 
 <div class="print-head">
-  <h1>Symptom summary{store.patient ? ` · ${store.patient.name}` : ''}</h1>
+  <h1>Summary{store.patient ? ` · ${store.patient.name}` : ''}</h1>
   <p class="muted">{dayLabel(days[0])} – {dayLabel(days[days.length - 1])} · {entries.length} entries</p>
 </div>
 
 {#if error}<p class="muted">{error}</p>{/if}
 {#if loading && !entries.length}<p class="muted">Loading…</p>{/if}
+{#if rows.length}
+  <p class="muted small key">
+    <span class="swatch"></span> nobody logged anything that day ·
+    <span class="faint">●</span> nothing logged, so the usual state
+  </p>
+{/if}
 
 {#snippet axis()}
   {#each days as d, i}
@@ -116,34 +142,42 @@
   {/each}
 {/snippet}
 
-{#each rows as { sym, list, byDay } (sym.id)}
+{#snippet nodata(h: number)}
+  {#each days as d, i}
+    {#if !observed.has(d)}<rect x={colX(i) - colW / 2} y="0" width={colW} height={h} class="nodata" />{/if}
+  {/each}
+{/snippet}
+
+{#each rows as row (row.tracker.id)}
+  {@const { tracker, list, byDay } = row}
   <section class="card chart">
     <header>
-      <span class="title">{sym.icon ?? ''} {sym.name}</span>
+      <span class="title">{tracker.icon ?? ''} {tracker.name}</span>
       <span class="muted small">
-        {#if sym.kind === 'med'}
+        {#if tracker.kind === 'med'}
           given on {days.filter((d) => byDay.has(d)).length} of {days.length} days
-        {:else if sym.kind === 'number' && list.length}
-          latest {list[0].value} {sym.unit ?? ''}
+        {:else if tracker.kind === 'number' && list.length}
+          latest {list[0].value} {tracker.unit ?? ''}
         {:else}
-          {list.length} {list.length === 1 ? 'entry' : 'entries'}
+          {list.length} {list.length === 1 ? 'entry' : 'entries'}{row.normal ? `, otherwise ${row.normal.label}` : ''}
         {/if}
       </span>
     </header>
 
-    {#if list.length === 0}
+    {#if list.length === 0 && !row.assumed.size}
       <p class="muted small empty">Nothing logged in this period.</p>
-    {:else if sym.kind === 'note'}
+    {:else if tracker.kind === 'note'}
       <ul class="notes">
         {#each list as e (e.id)}
           <li><span class="muted small">{dayLabel(dayKey(e.occurred_at))} {clock(e.occurred_at)}</span> {e.note}</li>
         {/each}
       </ul>
-    {:else if sym.kind === 'scale' || sym.kind === 'choice'}
-      {@const opts = chartOptions(sym, list)}
+    {:else if tracker.kind === 'scale' || tracker.kind === 'choice'}
+      {@const opts = chartOptions(tracker, list)}
       {@const rowH = 18}
       {@const H = opts.length * rowH + 22}
-      <svg viewBox="0 0 {W} {H}" role="img" aria-label="{sym.name} per day">
+      <svg viewBox="0 0 {W} {H}" role="img" aria-label="{tracker.name} per day">
+        {@render nodata(opts.length * rowH)}
         {#each opts as o, j}
           <line x1={L} x2={W - R} y1={j * rowH + rowH / 2} y2={j * rowH + rowH / 2} class="grid" />
           <text x={L - 8} y={j * rowH + rowH / 2 + 4} class="ylab" class:retired={o.retired} text-anchor="end">{o.label.length > 10 ? o.label.slice(0, 9) + '…' : o.label}</text>
@@ -151,12 +185,15 @@
         {#each days as d, i}
           {@const de = byDay.get(d) ?? []}
           <rect x={colX(i) - colW / 2} y="0" width={colW} height={opts.length * rowH} class="hit" role="button" tabindex="-1"
-            onclick={() => tip(sym.id, describe(d, de))} onkeydown={() => {}} />
+            onclick={() => tip(tracker.id, describe(d, de, row))} onkeydown={() => {}} />
+          {#if row.assumed.has(d)}
+            <circle cx={colX(i)} cy={opts.indexOf(row.normal!) * rowH + rowH / 2} r="4" class="dot assumed" pointer-events="none" />
+          {/if}
           {#each opts as o, j}
             {@const n = de.filter((e) => e.option_id === o.id).length}
             {#if n}
               <circle cx={colX(i)} cy={j * rowH + rowH / 2} r={n > 1 ? 5.5 : 4} class="dot" class:retired={o.retired} pointer-events="none">
-                <title>{describe(d, de)}</title>
+                <title>{describe(d, de, row)}</title>
               </circle>
             {/if}
           {/each}
@@ -166,7 +203,7 @@
       {#if opts.some((o) => o.retired)}
         <p class="muted small legend">Greyed rows are retired options, still shown because they have entries in this period.</p>
       {/if}
-    {:else if sym.kind === 'number'}
+    {:else if tracker.kind === 'number'}
       {@const pts = days
         .map((d, i) => {
           const de = byDay.get(d);
@@ -180,7 +217,8 @@
         {@const hi = Math.max(...pts.map((p) => p!.v))}
         {@const pad = (hi - lo) * 0.15 || Math.abs(hi) * 0.05 || 1}
         {@const y = (v: number) => 8 + plotH - ((v - (lo - pad)) / (hi + pad - (lo - pad))) * plotH}
-        <svg viewBox="0 0 {W} {H}" role="img" aria-label="{sym.name} over time">
+        <svg viewBox="0 0 {W} {H}" role="img" aria-label="{tracker.name} over time">
+          {@render nodata(plotH + 8)}
           <line x1={L} x2={W - R} y1={8 + plotH} y2={8 + plotH} class="grid" />
           <text x={L - 8} y={y(hi) + 4} class="ylab" text-anchor="end">{hi}</text>
           {#if hi !== lo}<text x={L - 8} y={y(lo) + 4} class="ylab" text-anchor="end">{lo}</text>{/if}
@@ -190,7 +228,7 @@
           {#each pts as p}
             <circle cx={colX(p!.i)} cy={y(p!.v)} r="4" class="dot ring" pointer-events="none" />
             <rect x={colX(p!.i) - 12} y="0" width="24" height={plotH + 10} class="hit" role="button" tabindex="-1"
-              onclick={() => tip(sym.id, describe(p!.d, p!.de, sym.unit))} onkeydown={() => {}} />
+              onclick={() => tip(tracker.id, describe(p!.d, p!.de, row))} onkeydown={() => {}} />
           {/each}
           <g transform="translate(0 {H - 4})">{@render axis()}</g>
         </svg>
@@ -203,7 +241,8 @@
       {@const plotH = H - 32}
       {@const max = Math.max(1, ...days.map((d) => dayTotal(byDay.get(d))))}
       {@const bw = Math.max(3, Math.min(18, colW - 4))}
-      <svg viewBox="0 0 {W} {H}" role="img" aria-label="{sym.name} per day">
+      <svg viewBox="0 0 {W} {H}" role="img" aria-label="{tracker.name} per day">
+        {@render nodata(plotH + 12)}
         <line x1={L} x2={W - R} y1={12 + plotH} y2={12 + plotH} class="grid" />
         <text x={L - 8} y="16" class="ylab" text-anchor="end">{max}×</text>
         {#each days as d, i}
@@ -212,26 +251,26 @@
           {#if n}
             <path
               d="M{colX(i) - bw / 2},{12 + plotH} v{-(h - 3)} q0,-3 3,-3 h{bw - 6} q3,0 3,3 v{h - 3} z"
-              class="bar" class:med={sym.kind === 'med'} pointer-events="none"
+              class="bar" class:med={tracker.kind === 'med'} pointer-events="none"
             />
             {#if range <= 14}
               <text x={colX(i)} y={12 + plotH - h - 3} class="val" text-anchor="middle">{n}</text>
             {/if}
           {/if}
           <rect x={colX(i) - colW / 2} y="0" width={colW} height={plotH + 12} class="hit" role="button" tabindex="-1"
-            onclick={() => tip(sym.id, describe(d, byDay.get(d)))} onkeydown={() => {}} />
+            onclick={() => tip(tracker.id, describe(d, byDay.get(d), row))} onkeydown={() => {}} />
         {/each}
         <g transform="translate(0 {H - 4})">{@render axis()}</g>
       </svg>
     {/if}
 
-    {#if tips[sym.id]}<p class="tip small">{tips[sym.id]}</p>{/if}
+    {#if tips[tracker.id]}<p class="tip small">{tips[tracker.id]}</p>{/if}
   </section>
 {/each}
 
 <div class="actions no-print">
   <button class="btn" onclick={() => window.print()}>🖨️ Print / PDF</button>
-  <a class="btn" href={exportUrl()} download>⬇️ Export CSV</a>
+  <button class="btn" onclick={exportCsv} disabled={loading}>⬇️ Export CSV</button>
 </div>
 <p class="muted small no-print">Tap a day in a chart to see the details.</p>
 
@@ -250,6 +289,11 @@
   .val { fill: var(--text); font-size: 9px; }
   .dot { fill: var(--accent); }
   .dot.retired { fill: var(--muted); }
+  .dot.assumed { opacity: 0.28; }
+  .nodata { fill: var(--surface-2); }
+  .key { margin: 4px 2px 0; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: var(--surface-2); border: 1px solid var(--line); vertical-align: -1px; }
+  .faint { color: var(--accent); opacity: 0.35; }
   .ylab.retired { font-style: italic; opacity: 0.7; }
   .legend { margin: 4px 2px 0; }
   .ring { stroke: var(--surface); stroke-width: 2; }

@@ -1,19 +1,20 @@
 # 🐱 Cat tracker
 
-A small installable web app (PWA) for logging a cat's symptoms and medications from two phones.
+A small installable web app (PWA) for logging a cat's medications, symptoms and measurements from two phones.
 
 - **One-tap logging.** Meds, vomiting and other "it happened" items log on tap, with Undo/Edit in the toast. Scales (appetite, drinking…) take one more tap.
-- **Configurable symptoms.** Add, rename, pin, reorder or archive symptoms in Settings. New symptoms need no code change.
+- **Log only what's unusual.** Appetite, stool and the like have a normal state that's assumed on days nobody logged them. A "Nothing unusual today" button covers quiet days.
+- **Configurable trackers.** Add, rename, pin, reorder or archive trackers in Settings. New ones need no code change.
 - **Who did what.** Every entry records who logged it, which prevents double-dosing meds.
-- **Several patients.** Track a cat together, and keep your own migraine diary private. Each patient has their own symptoms, and is shared only with the users you choose.
-- **Vet summary.** 7/14/30-day charts per symptom, printable as a PDF, plus CSV export.
+- **Several patients.** Track a cat together, and keep your own migraine diary private. Each patient has their own trackers, and is shared only with the users you choose.
+- **Vet summary.** 7/14/30-day charts per tracker, printable as a PDF, plus CSV export.
 - **Works offline.** Entries logged without signal queue on the phone and sync later.
 
 Stack: **Rust** (Axum + SQLx + SQLite, argon2 passwords, cookie sessions) serving a **Svelte + Vite** PWA. Built with **Nix**; deployed as one container behind Nginx Proxy Manager.
 
 ```
 backend/    Rust server: JSON API under /api + serves the built PWA
-  migrations/   SQL schema + starter symptoms
+  migrations/   SQL schema
 frontend/   Svelte PWA (manifest, service worker, icons)
 flake.nix   dev shell (Rust + Node) and builds: PWA, server, Docker image
 compose.yml         production (Nginx Proxy Manager network)
@@ -38,8 +39,8 @@ Open http://localhost:5173 and log in as `demo` / `demo`. The demo user sees one
 Create real users with `just user georgii Georgii`. You'll be prompted for the password. Then create patients and decide who can see them:
 
 ```bash
-just patient Murka cat          # new patient with the cat starter symptoms
-just patient "Georgii" none     # empty patient; add symptoms in the app's Settings
+just patient Murka cat          # new patient with the cat starter trackers
+just patient "Georgii" none     # empty patient; add trackers in the app's Settings
 just share Murka georgii        # patients are referred to by name or id
 just share Murka wife
 just share Georgii georgii      # private: only shared with you
@@ -141,34 +142,43 @@ In Docker, prefix these with `docker compose exec cattracker`.
 
 ## Patients and access
 
-A **patient** is whoever is observed: the cat, or yourself. `patient_access` lists which users can see each patient, so a patient can be shared (the cat) or private (your migraines). Symptoms belong to a patient, and entries belong to a patient through their symptom. Every entry records who logged it (`logged_by`).
+A **patient** is whoever is observed: the cat, or yourself. `patient_access` lists which users can see each patient, so a patient can be shared (the cat) or private (your migraines). Trackers belong to a patient, and entries belong to a patient through their tracker. Every entry records who logged it (`logged_by`).
 
-All symptom and entry routes live under `/api/patients/{pid}/…`. A user without access to a patient gets 404, as if it didn't exist.
+All tracker, entry and check-in routes live under `/api/patients/{pid}/…`. A user without access to a patient gets 404, as if it didn't exist.
 
-## How symptoms work
+## How trackers work
 
-Symptoms are rows in `symptom_types`, each belonging to one patient, and each has a **kind** that decides how it's logged:
+A **tracker** is anything you log for a patient: a medication, an event, an observation or a measurement. Trackers are rows in `trackers`, each belonging to one patient, and each has a **kind** that decides how it's logged, which group it's shown in, and what a day without an entry means:
 
-| Kind | Logging | Example |
-|---|---|---|
-| `med` | one tap = dose given (optional default dose) | Omeprazole |
-| `bool` | one tap = it happened | Sneezed |
-| `count` | one tap = one occurrence | Vomited |
-| `scale` | pick from ordered options (least → most) | Appetite: none / little / normal / good |
-| `choice` | pick from options | Stool: normal / soft / diarrhea / … |
-| `number` | type a value with a unit | Weight (kg), glucose (mmol/L) |
-| `note` | free text | Anything unusual |
+| Kind | Group | Logging | Example | Nothing logged means |
+|---|---|---|---|---|
+| `med` | Medications | one tap = dose given (optional default dose) | Omeprazole | not given |
+| `bool` | Events | one tap = it happened | Sneezed | didn't happen |
+| `count` | Events | one tap = one occurrence | Vomited | didn't happen |
+| `scale` | Observations | pick from ordered options (least → most) | Appetite: none / little / normal / good | the normal option, if it has one |
+| `choice` | Observations | pick from options | Stool: normal / soft / diarrhea / … | the normal option, if it has one |
+| `number` | Measurements | type a value with a unit | Weight (kg), glucose (mmol/L) | unknown |
+| `note` | Notes | free text | Anything unusual | nothing |
 
-Starter sets are presets in `backend/src/patients.rs` (`--preset cat`). Everything is editable in the app. A symptom's kind can't change after creation, because that would make old entries meaningless; archive it and create a new one instead.
+Starter sets are presets in `backend/src/patients.rs` (`--preset cat`). Everything is editable in the app. A tracker's kind can't change after creation, because that would make old entries meaningless; archive it and create a new one instead.
+
+### Normal days
+
+A scale or choice can mark one option as **normal** (Settings → the tracker → "On a day without an entry"). Then you only log when something is off, and a day without an entry counts as normal. A migraine "Headache" scale would have a "none" option marked normal.
+
+"Nothing logged" only means normal on **observed** days: days where someone logged anything for the patient, or tapped **Nothing unusual today** (a check-in, stored in `checkins`). On days nobody touched the app, nothing is assumed, because nobody looked. Normal is also not assumed before the tracker was created, or for archived trackers.
+
+In the summary, days nobody logged anything are shaded, and assumed normal days are drawn as faint dots. The CSV export lists assumed days as rows with `source` = `assumed (nothing logged)`, next to logged entries and check-ins.
 
 ### Options (scale and choice)
 
-Options live in `symptom_options`, and entries point at them by id. That way history stays correct when options change:
+Options live in `tracker_options`, and entries point at them by id. That way history stays correct when options change:
 
 - **Rename** an option by editing its label. Every past entry shows the new name.
 - **Retire** an option when you replace it with something different (e.g. "soft / hard" → "diarrhea / porridge / sausage / stone"). It's no longer offered when logging. Old entries keep it, and the summary shows it as a greyed row while it has entries in the period. There's no automatic mapping, because only you know what an old "soft" meant.
 - **Merge** a retired option into another one to move its entries over, for typos or duplicates. This is the only operation that rewrites history, and it asks first.
 - An option with no entries can simply be removed. One with entries can't be deleted.
+- The normal option can't be retired; pick another normal option (or none) first.
 
 ## API (all JSON, cookie auth)
 
@@ -179,18 +189,22 @@ GET    /api/me
 GET    /api/patients          patients you can see: [{id, name, icon, shared_with}]
 
 Below, P = /api/patients/{pid} (404 without access to that patient):
-GET    P/symptoms[?include_archived=true]
-POST   P/symptoms          {name, kind, options?, unit?, icon?, pinned?}
-PATCH  P/symptoms/{id}     any of: name, options, unit, icon, pinned, archived
-                           options = full ordered list [{id?, label, retired}]; no id = new
-POST   P/symptoms/{id}/options/{option_id}/merge   {into: option_id}
-PUT    P/symptoms/order    [id, id, …]
-GET    P/entries?from=&to=&symptom_id=&limit=
-POST   P/entries           {id?: uuid, symptom_id, value? | option_id?, note?, occurred_at?}   (idempotent on id)
+GET    P/trackers[?include_archived=true]
+POST   P/trackers          {name, kind, options?, unit?, icon?, pinned?}
+PATCH  P/trackers/{id}     any of: name, options, unit, icon, pinned, archived
+                           options = full ordered list [{id?, label, retired, normal}]; no id = new
+POST   P/trackers/{id}/options/{option_id}/merge   {into: option_id}
+PUT    P/trackers/order    [id, id, …]
+GET    P/entries?from=&to=&tracker_id=&limit=
+POST   P/entries           {id?: uuid, tracker_id, value? | option_id?, note?, occurred_at?}   (idempotent on id)
 PATCH  P/entries/{id}      {value? | option_id?, note?, occurred_at?}
 DELETE P/entries/{id}
-GET    P/export.csv?from=&to=
+GET    P/checkins?from=&to=
+POST   P/checkins          {id?: uuid, occurred_at?}   "nothing unusual" (idempotent on id)
+DELETE P/checkins/{id}
 ```
+
+The CSV export is built in the browser from what the summary shows, because only the phone knows its time zone (which day an entry belongs to).
 
 ## Ideas for later
 

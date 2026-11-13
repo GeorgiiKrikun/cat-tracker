@@ -25,11 +25,13 @@ export interface Patient {
   shared_with: string[];
 }
 
-export interface SymptomOption {
+export interface TrackerOption {
   id: number;
   label: string;
   /** Hidden from logging; old entries still show it. */
   retired: boolean;
+  /** The usual state: assumed on observed days without an entry. */
+  normal: boolean;
   /** Number of entries using this option. */
   uses: number;
 }
@@ -39,32 +41,65 @@ export interface OptionInput {
   id?: number;
   label: string;
   retired: boolean;
+  normal: boolean;
 }
 
 export const hasOptions = (kind: Kind | undefined) => kind === 'scale' || kind === 'choice';
 
-export interface Symptom {
+/** The option assumed when nothing is logged on an observed day, if the tracker has one. */
+export const normalOption = (t: Tracker) => t.options.find((o) => o.normal && !o.retired);
+
+/** How trackers are grouped on screen; the kind decides the group. */
+export const CATEGORIES: { label: string; kinds: Kind[] }[] = [
+  { label: 'Medications', kinds: ['med'] },
+  { label: 'Events', kinds: ['bool', 'count'] },
+  { label: 'Observations', kinds: ['scale', 'choice'] },
+  { label: 'Measurements', kinds: ['number'] },
+  { label: 'Notes', kinds: ['note'] },
+];
+
+/** Trackers grouped by category, keeping their order inside each group; empty groups left out. */
+export function byCategory(trackers: Tracker[]): { label: string; items: Tracker[] }[] {
+  return CATEGORIES.map((c) => ({ label: c.label, items: trackers.filter((t) => c.kinds.includes(t.kind)) })).filter(
+    (g) => g.items.length,
+  );
+}
+
+export interface Tracker {
   id: number;
   name: string;
   kind: Kind;
   /** In order (scale order for scales), retired ones included. */
-  options: SymptomOption[];
+  options: TrackerOption[];
   unit: string | null;
   icon: string | null;
   pinned: boolean;
   archived: boolean;
   sort_order: number;
+  /** Normal options aren't assumed for days before this. */
+  created_at: string;
 }
 
 export interface Entry {
   id: string;
-  symptom_id: number;
-  symptom_name: string;
+  tracker_id: number;
+  tracker_name: string;
   kind: Kind;
   /** Set for scale/choice entries; `value` then carries the option's label. */
   option_id: number | null;
   value: string | null;
   note: string | null;
+  logged_by: number | null;
+  logged_by_name: string | null;
+  occurred_at: string;
+  created_at: string;
+  /** Local only: not yet confirmed by the server. */
+  pending?: boolean;
+}
+
+/** "Nothing unusual today": marks the day as observed, so normal options apply. */
+export interface Checkin {
+  id: string;
   logged_by: number | null;
   logged_by_name: string | null;
   occurred_at: string;
@@ -79,11 +114,11 @@ export interface EntryValue {
   option_id: number | null;
 }
 
-export type SymptomInput = Partial<Omit<Symptom, 'options'>> & { options?: OptionInput[] };
+export type TrackerInput = Partial<Omit<Tracker, 'options'>> & { options?: OptionInput[] };
 
 export interface NewEntry {
   id: string;
-  symptom_id: number;
+  tracker_id: number;
   value?: string | null;
   option_id?: number | null;
   note?: string | null;
@@ -116,7 +151,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return res.json() as Promise<T>;
 }
 
-/** Everything about symptoms and entries lives under the patient it belongs to. */
+/** Everything about trackers and entries lives under the patient it belongs to. */
 const pp = (pid: number) => `/patients/${pid}`;
 
 export const api = {
@@ -126,17 +161,17 @@ export const api = {
   logout: () => request<void>('POST', '/auth/logout'),
   patients: () => request<Patient[]>('GET', '/patients'),
 
-  symptoms: (pid: number, includeArchived = false) =>
-    request<Symptom[]>('GET', `${pp(pid)}/symptoms${includeArchived ? '?include_archived=true' : ''}`),
-  createSymptom: (pid: number, s: SymptomInput) => request<Symptom>('POST', `${pp(pid)}/symptoms`, s),
-  updateSymptom: (pid: number, id: number, s: SymptomInput) =>
-    request<Symptom>('PATCH', `${pp(pid)}/symptoms/${id}`, s),
+  trackers: (pid: number, includeArchived = false) =>
+    request<Tracker[]>('GET', `${pp(pid)}/trackers${includeArchived ? '?include_archived=true' : ''}`),
+  createTracker: (pid: number, s: TrackerInput) => request<Tracker>('POST', `${pp(pid)}/trackers`, s),
+  updateTracker: (pid: number, id: number, s: TrackerInput) =>
+    request<Tracker>('PATCH', `${pp(pid)}/trackers/${id}`, s),
   /** Move all entries of option `from` to option `into`, then delete `from`. */
-  mergeOption: (pid: number, symptomId: number, from: number, into: number) =>
-    request<Symptom>('POST', `${pp(pid)}/symptoms/${symptomId}/options/${from}/merge`, { into }),
-  reorderSymptoms: (pid: number, ids: number[]) => request<void>('PUT', `${pp(pid)}/symptoms/order`, ids),
+  mergeOption: (pid: number, trackerId: number, from: number, into: number) =>
+    request<Tracker>('POST', `${pp(pid)}/trackers/${trackerId}/options/${from}/merge`, { into }),
+  reorderTrackers: (pid: number, ids: number[]) => request<void>('PUT', `${pp(pid)}/trackers/order`, ids),
 
-  entries: (pid: number, params: { from?: string; to?: string; symptom_id?: number; limit?: number } = {}) => {
+  entries: (pid: number, params: { from?: string; to?: string; tracker_id?: number; limit?: number } = {}) => {
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) if (v !== undefined) q.set(k, String(v));
     return request<Entry[]>('GET', `${pp(pid)}/entries?${q}`);
@@ -145,7 +180,15 @@ export const api = {
   updateEntry: (pid: number, id: string, e: Partial<EntryValue> & { note?: string | null; occurred_at?: string }) =>
     request<Entry>('PATCH', `${pp(pid)}/entries/${id}`, e),
   deleteEntry: (pid: number, id: string) => request<void>('DELETE', `${pp(pid)}/entries/${id}`),
-  exportUrl: (pid: number, from: string) => `/api${pp(pid)}/export.csv?from=${encodeURIComponent(from)}`,
+
+  checkins: (pid: number, params: { from?: string; to?: string } = {}) => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v !== undefined) q.set(k, String(v));
+    return request<Checkin[]>('GET', `${pp(pid)}/checkins?${q}`);
+  },
+  createCheckin: (pid: number, c: { id: string; occurred_at: string }) =>
+    request<Checkin>('POST', `${pp(pid)}/checkins`, c),
+  deleteCheckin: (pid: number, id: string) => request<void>('DELETE', `${pp(pid)}/checkins/${id}`),
 };
 
 /** crypto.randomUUID only exists in secure contexts; fall back for plain-http LAN testing. */

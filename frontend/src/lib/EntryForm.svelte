@@ -1,15 +1,15 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { hasOptions as kindHasOptions, type Entry, type EntryValue, type Symptom } from './api';
+  import { hasOptions as kindHasOptions, type Entry, type EntryValue, type Tracker } from './api';
   import { fromLocalInput, toLocalInput } from './time';
 
   let {
-    symptom,
+    tracker,
     entry = null,
     onsubmit,
     ondelete,
   }: {
-    symptom: Symptom;
+    tracker: Tracker;
     /** When given, the form edits this entry instead of creating one. */
     entry?: Entry | null;
     onsubmit: (value: EntryValue, note: string | null, occurredAt: string) => void | Promise<void>;
@@ -17,15 +17,15 @@
   } = $props();
 
   // The form is re-created ({#key}) per entry, so initial values are all we need.
-  const init = untrack(() => ({ entry, symptom }));
+  const init = untrack(() => ({ entry, tracker }));
   const editing = !!init.entry;
-  const kind = init.symptom.kind;
+  const kind = init.tracker.kind;
 
   const hasOptions = kindHasOptions(kind);
-  let value = $state<string>(hasOptions ? '' : (init.entry?.value ?? (kind === 'med' ? (init.symptom.unit ?? '') : '')));
+  let value = $state<string>(hasOptions ? '' : (init.entry?.value ?? (kind === 'med' ? (init.tracker.unit ?? '') : '')));
   let optionId = $state<number | null>(init.entry?.option_id ?? null);
   // Retired options aren't offered, except the one this entry already has.
-  const options = init.symptom.options.filter((o) => !o.retired || o.id === init.entry?.option_id);
+  const options = init.tracker.options.filter((o) => !o.retired || o.id === init.entry?.option_id);
   let note = $state(init.entry?.note ?? '');
   let when = $state(toLocalInput(init.entry?.occurred_at ?? new Date().toISOString()));
   let details = $state(editing || kind === 'note');
@@ -79,9 +79,9 @@
       {/each}
     </div>
   {:else if kind === 'number'}
-    <label for="num">Value{symptom.unit ? ` (${symptom.unit})` : ''}</label>
+    <label for="num">Value{tracker.unit ? ` (${tracker.unit})` : ''}</label>
     <!-- svelte-ignore a11y_autofocus -->
-    <input id="num" inputmode="decimal" bind:value autofocus placeholder={symptom.unit ?? ''} />
+    <input id="num" inputmode="decimal" bind:value autofocus placeholder={tracker.unit ?? ''} />
   {:else if kind === 'med'}
     <label for="dose">Dose</label>
     <input id="dose" bind:value placeholder="e.g. ½ tablet" />

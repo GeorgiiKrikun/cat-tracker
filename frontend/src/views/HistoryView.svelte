@@ -1,22 +1,24 @@
 <script lang="ts">
-  import { api, type Entry, type Symptom } from '../lib/api';
+  import { api, type Checkin, type Entry, type Tracker } from '../lib/api';
   import { store } from '../lib/store.svelte';
-  import { clock, dayKey, dayLabel, startOfDay } from '../lib/time';
+  import Timeline from '../lib/Timeline.svelte';
+  import { dayKey, dayLabel, startOfDay } from '../lib/time';
 
-  let { onedit }: { onedit: (e: Entry) => void } = $props();
+  let { onedit, oncheckin }: { onedit: (e: Entry) => void; oncheckin: (c: Checkin) => void } = $props();
 
   let days = $state(7);
-  let symptomId = $state<number | ''>('');
+  let trackerId = $state<number | ''>('');
   let entries = $state<Entry[]>([]);
+  let checkins = $state<Checkin[]>([]);
   let loading = $state(false);
   let error = $state('');
-  let allSymptoms = $state<Symptom[]>([]);
+  let allTrackers = $state<Tracker[]>([]);
 
   $effect(() => {
     const pid = store.patientId;
-    symptomId = ''; // filters belong to the previous patient
+    trackerId = ''; // filters belong to the previous patient
     if (pid === null) return;
-    api.symptoms(pid, true).then((s) => (allSymptoms = s)).catch(() => (allSymptoms = store.symptoms));
+    api.trackers(pid, true).then((t) => (allTrackers = t)).catch(() => (allTrackers = store.trackers));
   });
 
   $effect(() => {
@@ -24,57 +26,53 @@
     void store.version;
     const pid = store.patientId;
     const d = days;
-    const sid = symptomId === '' ? undefined : symptomId;
+    const tid = trackerId === '' ? undefined : trackerId;
     if (pid === null) return;
     loading = true;
     error = '';
-    api
-      .entries(pid, { from: startOfDay(d - 1).toISOString(), symptom_id: sid, limit: 5000 })
-      .then((r) => (entries = r))
+    const from = startOfDay(d - 1).toISOString();
+    Promise.all([
+      api.entries(pid, { from, tracker_id: tid, limit: 5000 }),
+      // Check-ins aren't about one tracker, so a tracker filter hides them.
+      tid === undefined ? api.checkins(pid, { from }) : Promise.resolve([]),
+    ])
+      .then(([e, c]) => {
+        entries = e;
+        checkins = c;
+      })
       .catch((e) => (error = store.online ? String(e.message ?? e) : 'Offline — showing nothing until you reconnect.'))
       .finally(() => (loading = false));
   });
 
   const groups = $derived.by(() => {
-    const m = new Map<string, Entry[]>();
-    for (const e of entries) {
-      const k = dayKey(e.occurred_at);
-      if (!m.has(k)) m.set(k, []);
-      m.get(k)!.push(e);
-    }
-    return [...m.entries()];
+    const m = new Map<string, { entries: Entry[]; checkins: Checkin[] }>();
+    const day = (iso: string) => {
+      const k = dayKey(iso);
+      if (!m.has(k)) m.set(k, { entries: [], checkins: [] });
+      return m.get(k)!;
+    };
+    for (const e of entries) day(e.occurred_at).entries.push(e);
+    for (const c of checkins) day(c.occurred_at).checkins.push(c);
+    return [...m.entries()].sort(([a], [b]) => b.localeCompare(a));
   });
 </script>
 
 <div class="filters">
-  <select bind:value={symptomId} aria-label="Filter by symptom">
-    <option value="">All symptoms</option>
-    {#each allSymptoms as s (s.id)}
-      <option value={s.id}>{s.icon ?? ''} {s.name}{s.archived ? ' (archived)' : ''}</option>
+  <select bind:value={trackerId} aria-label="Filter by tracker">
+    <option value="">Everything</option>
+    {#each allTrackers as t (t.id)}
+      <option value={t.id}>{t.icon ?? ''} {t.name}{t.archived ? ' (archived)' : ''}</option>
     {/each}
   </select>
 </div>
 
 {#if error}<p class="muted">{error}</p>{/if}
 
-{#each groups as [key, list] (key)}
-  <h2>{dayLabel(key)} <span class="muted small">· {list.length}</span></h2>
-  <ul class="list card">
-    {#each list as e (e.id)}
-      <li>
-        <button onclick={() => onedit(e)}>
-          <span class="time">{clock(e.occurred_at)}</span>
-          <span class="what">
-            <b>{e.symptom_name}</b>{#if e.value && e.kind !== 'bool' && !(e.kind === 'count' && e.value === '1')}: {e.value}{/if}
-            {#if e.note}<div class="note muted">{e.note}</div>{/if}
-          </span>
-          <span class="who small muted">{e.logged_by_name ?? ''}</span>
-        </button>
-      </li>
-    {/each}
-  </ul>
+{#each groups as [key, g] (key)}
+  <h2>{dayLabel(key)} <span class="muted small">· {g.entries.length}</span></h2>
+  <Timeline entries={g.entries} checkins={g.checkins} {onedit} {oncheckin} />
 {:else}
-  {#if !loading && !error}<p class="muted">No entries in the last {days} days.</p>{/if}
+  {#if !loading && !error}<p class="muted">Nothing logged in the last {days} days.</p>{/if}
 {/each}
 
 <button class="btn block older" onclick={() => (days += 14)} disabled={loading}>
@@ -83,11 +81,5 @@
 
 <style>
   .filters { position: sticky; top: 0; padding: 4px 0 6px; background: var(--bg); z-index: 2; }
-  .list { list-style: none; margin: 0; padding: 4px 0; }
-  .list li + li { border-top: 1px solid var(--line); }
-  .list button { display: flex; width: 100%; gap: 12px; padding: 12px 14px; text-align: left; align-items: baseline; }
-  .time { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 44px; }
-  .what { flex: 1; }
-  .note { font-size: 14px; white-space: pre-wrap; }
   .older { margin-top: 20px; }
 </style>

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type Entry, type EntryValue, type Symptom } from './lib/api';
+  import { api, type Checkin, type Entry, type EntryValue, type Tracker } from './lib/api';
   import EntryForm from './lib/EntryForm.svelte';
   import Sheet from './lib/Sheet.svelte';
   import { store } from './lib/store.svelte';
@@ -31,15 +31,15 @@
   store.init();
 
   // Sheets
-  let logging = $state<Symptom | null>(null);
-  let editing = $state<{ entry: Entry; symptom: Symptom } | null>(null);
+  let logging = $state<Tracker | null>(null);
+  let editing = $state<{ entry: Entry; tracker: Tracker } | null>(null);
 
-  async function symptomFor(e: Entry): Promise<Symptom> {
-    const s = store.symptoms.find((x) => x.id === e.symptom_id);
+  async function trackerFor(e: Entry): Promise<Tracker> {
+    const s = store.trackers.find((x) => x.id === e.tracker_id);
     if (s) return s;
-    const all = await api.symptoms(store.patientId!, true);
-    const found = all.find((x) => x.id === e.symptom_id);
-    if (!found) throw new Error('symptom not found');
+    const all = await api.trackers(store.patientId!, true);
+    const found = all.find((x) => x.id === e.tracker_id);
+    if (!found) throw new Error('tracker not found');
     return found;
   }
 
@@ -47,7 +47,7 @@
     const entry = typeof e === 'string' ? store.recent.find((r) => r.id === e) : e;
     if (!entry) return;
     try {
-      editing = { entry, symptom: await symptomFor(entry) };
+      editing = { entry, tracker: await trackerFor(entry) };
     } catch {
       store.showToast("Can't edit while offline", undefined, true);
     }
@@ -63,9 +63,18 @@
 
   async function deleteEdit() {
     if (!editing) return;
-    if (!confirm(`Delete this ${editing.symptom.name} entry?`)) return;
+    if (!confirm(`Delete this ${editing.tracker.name} entry?`)) return;
     await store.remove(editing.entry.id);
     editing = null;
+  }
+
+  async function removeCheckin(c: Checkin) {
+    if (!confirm('Remove the “nothing unusual” check-in?')) return;
+    try {
+      await store.removeCheckin(c.id);
+    } catch {
+      store.showToast("Couldn't remove it — are you online?", undefined, true);
+    }
   }
 
   async function logFromSheet(value: EntryValue, note: string | null, occurredAt: string) {
@@ -116,9 +125,9 @@
         </p>
       </div>
     {:else if tab === 'log'}
-      <LogView onopen={(s) => (logging = s)} onedit={(id) => openEdit(id)} />
+      <LogView onopen={(t) => (logging = t)} onedit={(e) => openEdit(e)} oncheckin={removeCheckin} />
     {:else if tab === 'history'}
-      <HistoryView onedit={(e) => openEdit(e)} />
+      <HistoryView onedit={(e) => openEdit(e)} oncheckin={removeCheckin} />
     {:else if tab === 'summary'}
       <SummaryView />
     {:else}
@@ -139,8 +148,9 @@
       <span>{store.toast.text}</span>
       {#if store.toast.undoId}
         {@const id = store.toast.undoId}
-        <button onclick={() => { store.toast = null; openEdit(id); }}>Edit</button>
-        <button onclick={() => store.undo(id)}>Undo</button>
+        {@const checkin = store.toast.checkin}
+        {#if !checkin}<button onclick={() => { store.toast = null; openEdit(id); }}>Edit</button>{/if}
+        <button onclick={() => store.undo(id, checkin)}>Undo</button>
       {/if}
     </div>
   {/if}
@@ -148,15 +158,15 @@
   {#if logging}
     <Sheet title="{logging.icon ?? ''} {logging.name}" onclose={() => (logging = null)}>
       {#key logging.id}
-        <EntryForm symptom={logging} onsubmit={logFromSheet} />
+        <EntryForm tracker={logging} onsubmit={logFromSheet} />
       {/key}
     </Sheet>
   {/if}
 
   {#if editing}
-    <Sheet title="Edit {editing.symptom.name}" onclose={() => (editing = null)}>
+    <Sheet title="Edit {editing.tracker.name}" onclose={() => (editing = null)}>
       {#key editing.entry.id}
-        <EntryForm symptom={editing.symptom} entry={editing.entry} onsubmit={saveEdit} ondelete={deleteEdit} />
+        <EntryForm tracker={editing.tracker} entry={editing.entry} onsubmit={saveEdit} ondelete={deleteEdit} />
       {/key}
     </Sheet>
   {/if}

@@ -34,9 +34,16 @@ CREATE TABLE patient_access (
 );
 CREATE INDEX idx_access_user ON patient_access(user_id);
 
--- Symptom (and medication) definitions. These are data, edited in the app's
--- settings screen, so new symptoms never need a code change. Each patient
--- has their own list; entries belong to a patient through their symptom.
+-- Trackers: everything that can be logged for a patient — medications,
+-- events (vomited, a migraine attack), observations (appetite, stool) and
+-- measurements (weight). These are data, edited in the app's settings
+-- screen, so new trackers never need a code change. Each patient has their
+-- own list; entries belong to a patient through their tracker.
+--
+-- What a day without an entry means depends on the kind: nothing happened
+-- (bool, count, med), unknown (number), or the tracker's normal option
+-- (scale/choice that have one), but only on days someone logged anything
+-- for the patient (an entry or a check-in); otherwise nobody looked.
 --
 -- kind:
 --   bool    one tap = "it happened"                  (value: "yes")
@@ -46,7 +53,7 @@ CREATE INDEX idx_access_user ON patient_access(user_id);
 --   number  measured value with unit, e.g. weight    (value: "4.2")
 --   med     medication dose given                    (value: dose text)
 --   note    free text only                           (value: NULL, text in note)
-CREATE TABLE symptom_types (
+CREATE TABLE trackers (
     id         INTEGER PRIMARY KEY,
     patient_id INTEGER NOT NULL REFERENCES patients(id),
     name       TEXT NOT NULL,
@@ -58,41 +65,58 @@ CREATE TABLE symptom_types (
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-CREATE INDEX idx_symptoms_patient ON symptom_types(patient_id, sort_order);
+CREATE INDEX idx_trackers_patient ON trackers(patient_id, sort_order);
 
--- Options of scale/choice symptoms. Entries point at an option by id, so
+-- Options of scale/choice trackers. Entries point at an option by id, so
 -- renaming the label renames it everywhere. Options that have entries are
 -- never deleted, only retired (hidden from logging, still shown in history).
 -- sort_order is the scale order for scales (worst/least first).
-CREATE TABLE symptom_options (
+-- At most one active option per tracker is `normal`: the usual state,
+-- assumed on observed days where nothing was logged for the tracker.
+CREATE TABLE tracker_options (
     id         INTEGER PRIMARY KEY,
-    symptom_id INTEGER NOT NULL REFERENCES symptom_types(id),
+    tracker_id INTEGER NOT NULL REFERENCES trackers(id),
     label      TEXT NOT NULL,
     retired    INTEGER NOT NULL DEFAULT 0,
+    normal     INTEGER NOT NULL DEFAULT 0,
     sort_order INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (id, symptom_id)       -- target of the composite key in entries
+    UNIQUE (id, tracker_id),      -- target of the composite key in entries
+    CHECK (NOT (normal AND retired))
 );
-CREATE INDEX idx_options_symptom ON symptom_options(symptom_id, sort_order);
+CREATE INDEX idx_options_tracker ON tracker_options(tracker_id, sort_order);
+CREATE UNIQUE INDEX idx_options_one_normal ON tracker_options(tracker_id) WHERE normal;
 
 -- Logged observations. The id is a client-generated UUID so that entries
 -- queued while offline can be re-sent safely (inserts are idempotent).
 -- logged_by records who logged it, which matters for shared patients.
 -- option_id is set for scale/choice entries (value is then NULL); the
--- composite key makes sure the option belongs to the entry's symptom.
+-- composite key makes sure the option belongs to the entry's tracker.
 CREATE TABLE entries (
     id          TEXT PRIMARY KEY,
-    symptom_id  INTEGER NOT NULL REFERENCES symptom_types(id),
+    tracker_id  INTEGER NOT NULL REFERENCES trackers(id),
     option_id   INTEGER,
     value       TEXT,
     note        TEXT,
     logged_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
     occurred_at TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    FOREIGN KEY (option_id, symptom_id) REFERENCES symptom_options(id, symptom_id)
+    FOREIGN KEY (option_id, tracker_id) REFERENCES tracker_options(id, tracker_id)
 );
 CREATE INDEX idx_entries_time ON entries(occurred_at);
-CREATE INDEX idx_entries_symptom_time ON entries(symptom_id, occurred_at);
+CREATE INDEX idx_entries_tracker_time ON entries(tracker_id, occurred_at);
 CREATE INDEX idx_entries_option ON entries(option_id);
 
--- Starter symptom sets are presets in backend/src/patients.rs, applied by
+-- "Nothing unusual today": marks a day as observed when there was nothing
+-- else to log, so normal options are assumed for it. Client-generated UUID
+-- like entries, for the offline queue.
+CREATE TABLE checkins (
+    id          TEXT PRIMARY KEY,
+    patient_id  INTEGER NOT NULL REFERENCES patients(id),
+    logged_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    occurred_at TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX idx_checkins_patient_time ON checkins(patient_id, occurred_at);
+
+-- Starter tracker sets are presets in backend/src/patients.rs, applied by
 -- `cattracker add-patient --preset ...`.

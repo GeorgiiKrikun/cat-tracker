@@ -1,45 +1,57 @@
 <script lang="ts">
-  import { api, hasOptions, KIND_LABELS, type Kind, type OptionInput, type Symptom, type SymptomInput } from '../lib/api';
+  import {
+    api,
+    byCategory,
+    hasOptions,
+    KIND_LABELS,
+    type Kind,
+    type OptionInput,
+    type Tracker,
+    type TrackerInput,
+  } from '../lib/api';
   import Sheet from '../lib/Sheet.svelte';
   import { store } from '../lib/store.svelte';
 
-  let all = $state<Symptom[]>([]);
-  let editing = $state<Partial<Symptom> | null>(null);
+  let all = $state<Tracker[]>([]);
+  let editing = $state<Partial<Tracker> | null>(null);
   /** The option list being edited; `id` is missing for options not saved yet. */
   type EditOption = OptionInput & { uses: number };
   let opts = $state<EditOption[]>([]);
   let error = $state('');
   let busy = $state(false);
 
-  /** Patient whose symptoms are shown (Settings only renders with one selected). */
+  /** Patient whose trackers are shown (Settings only renders with one selected). */
   const pid = () => store.patientId!;
 
   async function load() {
-    all = await api.symptoms(pid(), true);
+    all = await api.trackers(pid(), true);
   }
   $effect(() => {
     if (store.patientId === null) {
       all = [];
       return;
     }
-    load().catch(() => (all = store.symptoms));
+    load().catch(() => (all = store.trackers));
   });
 
   const active = $derived(all.filter((s) => !s.archived));
   const archived = $derived(all.filter((s) => s.archived));
 
-  async function patch(s: Symptom, p: SymptomInput) {
-    await api.updateSymptom(pid(), s.id, p);
-    await Promise.all([load(), store.reloadSymptoms()]);
+  async function patch(s: Tracker, p: TrackerInput) {
+    await api.updateTracker(pid(), s.id, p);
+    await Promise.all([load(), store.reloadTrackers()]);
   }
 
-  async function move(i: number, dir: -1 | 1) {
-    const ids = active.map((s) => s.id);
-    const j = i + dir;
-    if (j < 0 || j >= ids.length) return;
-    [ids[i], ids[j]] = [ids[j], ids[i]];
-    await api.reorderSymptoms(pid(), [...ids, ...archived.map((s) => s.id)]);
-    await Promise.all([load(), store.reloadSymptoms()]);
+  /** Swap a tracker with its neighbour in the same group (groups are shown by kind). */
+  async function move(group: Tracker[], k: number, dir: -1 | 1) {
+    const other = group[k + dir];
+    if (!other) return;
+    const ids = active.map((t) => t.id);
+    const a = ids.indexOf(group[k].id);
+    const b = ids.indexOf(other.id);
+    [ids[a], ids[b]] = [ids[b], ids[a]];
+    await api.reorderTrackers(pid(), [...ids, ...archived.map((t) => t.id)]);
+    await Promise.all([load(), store.reloadTrackers()]);
   }
 
   function openNew() {
@@ -47,7 +59,7 @@
     opts = [newOption(), newOption()];
     error = '';
   }
-  function openEdit(s: Symptom) {
+  function openEdit(s: Tracker) {
     editing = { ...s };
     opts = s.options.map((o) => ({ ...o }));
     error = '';
@@ -56,7 +68,7 @@
   const needsOptions = $derived(hasOptions(editing?.kind));
 
   // ---- option list editor ----
-  const newOption = (): EditOption => ({ label: '', retired: false, uses: 0 });
+  const newOption = (): EditOption => ({ label: '', retired: false, normal: false, uses: 0 });
   /** Indexes into `opts` of the active options, in order. */
   const activeIdx = $derived(opts.flatMap((o, i) => (o.retired ? [] : [i])));
   const retiredOpts = $derived(opts.filter((o) => o.retired));
@@ -69,8 +81,15 @@
   }
   /** Unused options are simply removed; used ones are retired so their history stays. */
   function retireOrRemove(i: number) {
-    if (opts[i].uses > 0) opts[i].retired = true;
-    else opts.splice(i, 1);
+    if (opts[i].uses > 0) {
+      opts[i].retired = true;
+      opts[i].normal = false;
+    } else opts.splice(i, 1);
+  }
+  /** Index into `opts` of the normal option, or -1: what a day without an entry means. */
+  const normalIdx = $derived(opts.findIndex((o) => o.normal && !o.retired));
+  function setNormal(i: number) {
+    opts.forEach((o, j) => (o.normal = j === i));
   }
   function unusedRetired(o: EditOption) {
     opts.splice(opts.indexOf(o), 1);
@@ -86,7 +105,7 @@
       // Apply locally so other unsaved edits in the form survive.
       into.uses += from.uses;
       opts.splice(opts.indexOf(from), 1);
-      await Promise.all([load(), store.reloadSymptoms()]);
+      await Promise.all([load(), store.reloadTrackers()]);
       store.version++;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -97,7 +116,7 @@
     if (!editing) return;
     busy = true;
     error = '';
-    const body: SymptomInput = {
+    const body: TrackerInput = {
       name: editing.name,
       icon: editing.icon || null,
       unit: editing.unit || null,
@@ -106,13 +125,13 @@
     if (needsOptions) {
       body.options = opts
         .filter((o) => o.id !== undefined || o.label.trim()) // drop blank new rows
-        .map(({ id, label, retired }) => ({ id, label, retired }));
+        .map(({ id, label, retired, normal }) => ({ id, label, retired, normal }));
     }
     try {
-      if (editing.id) await api.updateSymptom(pid(), editing.id, body);
-      else await api.createSymptom(pid(), { ...body, kind: editing.kind });
+      if (editing.id) await api.updateTracker(pid(), editing.id, body);
+      else await api.createTracker(pid(), { ...body, kind: editing.kind });
       editing = null;
-      await Promise.all([load(), store.reloadSymptoms()]);
+      await Promise.all([load(), store.reloadTrackers()]);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -124,30 +143,36 @@
 </script>
 
 {#if store.patient}
-<h2>Symptoms & medications{store.patient ? ` · ${store.patient.name}` : ''}</h2>
+<h2>Trackers · {store.patient.name}</h2>
 <p class="muted small">
-  {#if store.patient?.shared_with.length}Shared with {store.patient.shared_with.join(', ')}.{:else}Only you can see this patient.{/if}
+  {#if store.patient.shared_with.length}Shared with {store.patient.shared_with.join(', ')}.{:else}Only you can see this patient.{/if}
   ⭐ = shown as a button on the Log screen. The rest are under “More”.
 </p>
 
-<ul class="list card">
-  {#each active as s, i (s.id)}
-    <li>
-      <button class="star" class:on={s.pinned} onclick={() => patch(s, { pinned: !s.pinned })} aria-label={s.pinned ? 'Unpin' : 'Pin'}>
-        {s.pinned ? '⭐' : '☆'}
-      </button>
-      <button class="name" onclick={() => openEdit(s)}>
-        <span>{s.icon ?? ''} {s.name}</span>
-        <span class="muted small">{KIND_LABELS[s.kind]}{s.unit ? ` · ${s.unit}` : ''}</span>
-      </button>
-      <span class="order">
-        <button onclick={() => move(i, -1)} disabled={i === 0} aria-label="Move up">▲</button>
-        <button onclick={() => move(i, 1)} disabled={i === active.length - 1} aria-label="Move down">▼</button>
-      </span>
-    </li>
-  {/each}
-</ul>
-<button class="btn primary block add" onclick={openNew}>+ Add symptom or medication</button>
+{#each byCategory(active) as g (g.label)}
+  <h3 class="group">{g.label}</h3>
+  <ul class="list card">
+    {#each g.items as t, k (t.id)}
+      {@const normal = t.options.find((o) => o.normal && !o.retired)}
+      <li>
+        <button class="star" class:on={t.pinned} onclick={() => patch(t, { pinned: !t.pinned })} aria-label={t.pinned ? 'Unpin' : 'Pin'}>
+          {t.pinned ? '⭐' : '☆'}
+        </button>
+        <button class="name" onclick={() => openEdit(t)}>
+          <span>{t.icon ?? ''} {t.name}</span>
+          <span class="muted small">
+            {KIND_LABELS[t.kind]}{t.unit ? ` · ${t.unit}` : ''}{normal ? ` · usually ${normal.label}` : ''}
+          </span>
+        </button>
+        <span class="order">
+          <button onclick={() => move(g.items, k, -1)} disabled={k === 0} aria-label="Move up">▲</button>
+          <button onclick={() => move(g.items, k, 1)} disabled={k === g.items.length - 1} aria-label="Move down">▼</button>
+        </span>
+      </li>
+    {/each}
+  </ul>
+{/each}
+<button class="btn primary block add" onclick={openNew}>+ Add tracker</button>
 
 {#if archived.length}
   <h2>Archived</h2>
@@ -174,7 +199,7 @@
 </p>
 
 {#if editing}
-  <Sheet title={editing.id ? `Edit ${editing.name}` : 'New symptom'} onclose={() => (editing = null)}>
+  <Sheet title={editing.id ? `Edit ${editing.name}` : 'New tracker'} onclose={() => (editing = null)}>
     <label for="s-name">Name</label>
     <input id="s-name" bind:value={editing.name} placeholder="e.g. Sneezing" />
 
@@ -209,6 +234,18 @@
         {/each}
       </ul>
       <button class="link" onclick={() => opts.push(newOption())}>+ Add option</button>
+
+      <label for="s-normal">On a day without an entry</label>
+      <select id="s-normal" value={normalIdx} onchange={(ev) => setNormal(Number(ev.currentTarget.value))}>
+        <option value={-1}>Unknown: show a gap</option>
+        {#each activeIdx as i, k (opts[i])}
+          <option value={i}>Assume “{opts[i].label.trim() || `option ${k + 1}`}”</option>
+        {/each}
+      </select>
+      <p class="muted small hint">
+        Pick the usual state (e.g. “normal”) to log only when something is off. It's assumed on days someone
+        logged anything for {store.patient?.name ?? "this patient"}, or marked “Nothing unusual today”.
+      </p>
       <p class="muted small hint">
         Editing a label renames it everywhere, past entries included. To replace an option with something
         different, retire it and add a new one: old entries keep the old option.
@@ -260,7 +297,7 @@
     {#if error}<p class="error">{error}</p>{/if}
     <button class="btn primary block save" onclick={saveEdit} disabled={busy}>Save</button>
     {#if editing.id}
-      <button class="btn block archive" onclick={async () => { await patch(editing as Symptom, { archived: true }); editing = null; }}>
+      <button class="btn block archive" onclick={async () => { await patch(editing as Tracker, { archived: true }); editing = null; }}>
         Archive (hide, keep history)
       </button>
     {/if}
@@ -278,6 +315,7 @@
   .order button { width: 36px; height: 44px; color: var(--muted); font-size: 12px; }
   .order button:disabled { opacity: 0.25; }
   .add { margin-top: 12px; }
+  .group { margin: 14px 2px 6px; font-size: 13px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .account { padding: 4px 14px 14px; }
   .fixed { margin: 0; }
   .check { display: flex; gap: 10px; align-items: center; color: var(--text); margin-top: 18px; }

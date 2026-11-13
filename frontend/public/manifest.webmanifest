@@ -1,7 +1,7 @@
 {
   "name": "Cat tracker",
   "short_name": "Cat tracker",
-  "description": "Log the cat's symptoms and medications",
+  "description": "Log a cat's (or your own) symptoms, medications and measurements",
   "start_url": "/#log",
   "scope": "/",
   "display": "standalone",
