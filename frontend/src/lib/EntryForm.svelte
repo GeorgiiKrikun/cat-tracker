@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { Entry, Symptom } from './api';
+  import { hasOptions as kindHasOptions, type Entry, type EntryValue, type Symptom } from './api';
   import { fromLocalInput, toLocalInput } from './time';
 
   let {
@@ -12,7 +12,7 @@
     symptom: Symptom;
     /** When given, the form edits this entry instead of creating one. */
     entry?: Entry | null;
-    onsubmit: (value: string | null, note: string | null, occurredAt: string) => void | Promise<void>;
+    onsubmit: (value: EntryValue, note: string | null, occurredAt: string) => void | Promise<void>;
     ondelete?: () => void | Promise<void>;
   } = $props();
 
@@ -21,23 +21,26 @@
   const editing = !!init.entry;
   const kind = init.symptom.kind;
 
-  let value = $state<string>(init.entry?.value ?? (kind === 'med' ? (init.symptom.unit ?? '') : ''));
+  const hasOptions = kindHasOptions(kind);
+  let value = $state<string>(hasOptions ? '' : (init.entry?.value ?? (kind === 'med' ? (init.symptom.unit ?? '') : '')));
+  let optionId = $state<number | null>(init.entry?.option_id ?? null);
+  // Retired options aren't offered, except the one this entry already has.
+  const options = init.symptom.options.filter((o) => !o.retired || o.id === init.entry?.option_id);
   let note = $state(init.entry?.note ?? '');
   let when = $state(toLocalInput(init.entry?.occurred_at ?? new Date().toISOString()));
   let details = $state(editing || kind === 'note');
   let busy = $state(false);
   let error = $state('');
 
-  const hasOptions = kind === 'scale' || kind === 'choice';
   const needsSubmit = $derived(editing || details || !hasOptions);
 
-  async function submit(v: string | null = value) {
+  async function submit(v: string | null = value, opt: number | null = optionId) {
     error = '';
     if (kind === 'number' && (v === null || v.trim() === '' || isNaN(Number(v.replace(',', '.'))))) {
       error = 'Enter a number';
       return;
     }
-    if (hasOptions && !v) {
+    if (hasOptions && opt === null) {
       error = 'Pick one';
       return;
     }
@@ -47,8 +50,8 @@
     }
     busy = true;
     try {
-      const val = kind === 'note' ? null : v && v.trim() !== '' ? v.trim() : null;
-      await onsubmit(val, note.trim() || null, fromLocalInput(when));
+      const val = kind === 'note' || hasOptions ? null : v && v.trim() !== '' ? v.trim() : null;
+      await onsubmit({ value: val, option_id: hasOptions ? opt : null }, note.trim() || null, fromLocalInput(when));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -56,21 +59,22 @@
     }
   }
 
-  function pick(opt: string) {
-    value = opt;
-    if (!needsSubmit) submit(opt);
+  function pick(id: number) {
+    optionId = id;
+    if (!needsSubmit) submit(null, id);
   }
 </script>
 
 <div class="form">
   {#if hasOptions}
     <div class="options" class:scale={kind === 'scale'}>
-      {#each symptom.options as opt}
+      {#each options as opt (opt.id)}
         <button
           class="opt"
-          class:selected={value === opt}
-          onclick={() => pick(opt)}
-          disabled={busy}>{opt}</button
+          class:selected={optionId === opt.id}
+          class:retired={opt.retired}
+          onclick={() => pick(opt.id)}
+          disabled={busy}>{opt.label}{#if opt.retired}<span class="small muted"> (retired)</span>{/if}</button
         >
       {/each}
     </div>
@@ -117,6 +121,7 @@
     font-weight: 600; font-size: 17px; border: 2px solid transparent; text-transform: capitalize;
   }
   .opt.selected { border-color: var(--accent); background: var(--accent-soft); }
+  .opt.retired { font-weight: 500; font-style: italic; }
   .more { color: var(--accent); font-weight: 600; padding: 16px 0 4px; }
   .submit { margin-top: 18px; }
   .btn.danger { margin-top: 10px; }

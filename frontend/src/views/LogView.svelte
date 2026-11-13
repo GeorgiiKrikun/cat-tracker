@@ -17,7 +17,7 @@
   function tap(s: Symptom) {
     if (instant(s)) {
       navigator.vibrate?.(15);
-      store.log(s, s.kind === 'med' ? s.unit : null);
+      store.log(s, { value: s.kind === 'med' ? s.unit : null, option_id: null });
     } else {
       onopen(s);
     }

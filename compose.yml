@@ -3,8 +3,7 @@
 # (SSL tab: Let's Encrypt + Force SSL + HTTP/2 + HSTS).
 services:
   cattracker:
-    build: .
-    image: cattracker:latest
+    image: cattracker:latest    # built by `just docker` (Nix), not by compose
     container_name: cattracker
     restart: unless-stopped
     volumes:

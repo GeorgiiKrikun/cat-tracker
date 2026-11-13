@@ -2,8 +2,7 @@
 # (plain HTTP, so Secure cookies are switched off).
 services:
   cattracker:
-    build: .
-    image: cattracker:latest
+    image: cattracker:latest    # `just docker-local` builds and loads it first
     environment:
       CT_COOKIE_SECURE: "false"
     ports:

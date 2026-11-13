@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type Entry, type Symptom } from '../lib/api';
+  import { api, type Entry, type Symptom, type SymptomOption } from '../lib/api';
   import { store } from '../lib/store.svelte';
   import { clock, dayKey, dayLabel, lastDays, shortDay, startOfDay } from '../lib/time';
 
@@ -71,6 +71,13 @@
       .map((e) => `${clock(e.occurred_at)}${e.value && e.kind !== 'bool' ? ' ' + e.value + (unit && e.kind === 'number' ? ' ' + unit : '') : ''}${e.logged_by_name ? ' (' + e.logged_by_name + ')' : ''}`);
     return `${dayLabel(day)}: ${parts.join(', ')}`;
   }
+  /** Chart rows: active options (best on top for scales), then retired ones that have data in this period. */
+  function chartOptions(sym: Symptom, list: Entry[]): SymptomOption[] {
+    const used = new Set(list.map((e) => e.option_id));
+    const active = sym.options.filter((o) => !o.retired);
+    const retired = sym.options.filter((o) => o.retired && used.has(o.id));
+    return [...(sym.kind === 'scale' ? active.reverse() : active), ...retired];
+  }
   function tip(id: number, text: string) {
     tips = { ...tips, [id]: text };
   }
@@ -131,22 +138,22 @@
         {/each}
       </ul>
     {:else if sym.kind === 'scale' || sym.kind === 'choice'}
-      {@const opts = sym.kind === 'scale' ? [...sym.options].reverse() : sym.options}
+      {@const opts = chartOptions(sym, list)}
       {@const rowH = 18}
       {@const H = opts.length * rowH + 22}
       <svg viewBox="0 0 {W} {H}" role="img" aria-label="{sym.name} per day">
         {#each opts as o, j}
           <line x1={L} x2={W - R} y1={j * rowH + rowH / 2} y2={j * rowH + rowH / 2} class="grid" />
-          <text x={L - 8} y={j * rowH + rowH / 2 + 4} class="ylab" text-anchor="end">{o.length > 10 ? o.slice(0, 9) + '…' : o}</text>
+          <text x={L - 8} y={j * rowH + rowH / 2 + 4} class="ylab" class:retired={o.retired} text-anchor="end">{o.label.length > 10 ? o.label.slice(0, 9) + '…' : o.label}</text>
         {/each}
         {#each days as d, i}
           {@const de = byDay.get(d) ?? []}
           <rect x={colX(i) - colW / 2} y="0" width={colW} height={opts.length * rowH} class="hit" role="button" tabindex="-1"
             onclick={() => tip(sym.id, describe(d, de))} onkeydown={() => {}} />
           {#each opts as o, j}
-            {@const n = de.filter((e) => e.value === o).length}
+            {@const n = de.filter((e) => e.option_id === o.id).length}
             {#if n}
-              <circle cx={colX(i)} cy={j * rowH + rowH / 2} r={n > 1 ? 5.5 : 4} class="dot" pointer-events="none">
+              <circle cx={colX(i)} cy={j * rowH + rowH / 2} r={n > 1 ? 5.5 : 4} class="dot" class:retired={o.retired} pointer-events="none">
                 <title>{describe(d, de)}</title>
               </circle>
             {/if}
@@ -154,6 +161,9 @@
         {/each}
         <g transform="translate(0 {H - 4})">{@render axis()}</g>
       </svg>
+      {#if opts.some((o) => o.retired)}
+        <p class="muted small legend">Greyed rows are retired options, still shown because they have entries in this period.</p>
+      {/if}
     {:else if sym.kind === 'number'}
       {@const pts = days
         .map((d, i) => {
@@ -237,6 +247,9 @@
   .ylab, .tick, .val { fill: var(--muted); font-size: 10px; }
   .val { fill: var(--text); font-size: 9px; }
   .dot { fill: var(--accent); }
+  .dot.retired { fill: var(--muted); }
+  .ylab.retired { font-style: italic; opacity: 0.7; }
+  .legend { margin: 4px 2px 0; }
   .ring { stroke: var(--surface); stroke-width: 2; }
   .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
   .bar { fill: var(--accent); }

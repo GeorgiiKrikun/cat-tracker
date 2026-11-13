@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type Entry, type Symptom } from './lib/api';
+  import { api, type Entry, type EntryValue, type Symptom } from './lib/api';
   import EntryForm from './lib/EntryForm.svelte';
   import Sheet from './lib/Sheet.svelte';
   import { store } from './lib/store.svelte';
@@ -53,11 +53,11 @@
     }
   }
 
-  async function saveEdit(value: string | null, note: string | null, occurredAt: string) {
+  async function saveEdit(value: EntryValue, note: string | null, occurredAt: string) {
     if (!editing) return;
     if (editing.entry.pending) await store.flush();
     if (store.queue.some((q) => q.id === editing!.entry.id)) throw new Error('Not synced yet — try again when online.');
-    await store.update(editing.entry.id, { value, note, occurred_at: occurredAt });
+    await store.update(editing.entry.id, { ...value, note, occurred_at: occurredAt });
     editing = null;
   }
 
@@ -68,7 +68,7 @@
     editing = null;
   }
 
-  async function logFromSheet(value: string | null, note: string | null, occurredAt: string) {
+  async function logFromSheet(value: EntryValue, note: string | null, occurredAt: string) {
     if (!logging) return;
     const s = logging;
     logging = null;

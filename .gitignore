@@ -7,3 +7,8 @@ data-local/
 *.db-shm
 *.db-wal
 .env
+
+# nix
+result
+result-*
+.direnv/

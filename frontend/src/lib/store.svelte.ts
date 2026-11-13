@@ -1,4 +1,4 @@
-import { api, ApiError, uuid, type Entry, type NewEntry, type Symptom, type User } from './api';
+import { api, ApiError, uuid, type Entry, type EntryValue, type NewEntry, type Symptom, type User } from './api';
 import { startOfDay } from './time';
 
 const LS = {
@@ -128,17 +128,24 @@ class Store {
   }
 
   /** Log an entry. Shows immediately; syncs now or when back online. */
-  async log(sym: Symptom, value: string | null, note: string | null = null, occurredAt?: string) {
+  async log(sym: Symptom, { value, option_id }: EntryValue, note: string | null = null, occurredAt?: string) {
     const e: NewEntry = {
       id: uuid(),
       symptom_id: sym.id,
       value,
+      option_id,
       note,
       occurred_at: occurredAt ?? new Date().toISOString(),
     };
+    // Shown until the server confirms it, so fill in what the server would.
+    const shown =
+      option_id !== null
+        ? (sym.options.find((o) => o.id === option_id)?.label ?? null)
+        : (value ?? (sym.kind === 'bool' ? 'yes' : sym.kind === 'count' ? '1' : null));
     const local: Entry = {
       ...e,
-      value: value ?? (sym.kind === 'bool' ? 'yes' : sym.kind === 'count' ? '1' : null),
+      option_id,
+      value: shown,
       note,
       symptom_name: sym.name,
       kind: sym.kind,
@@ -152,7 +159,7 @@ class Store {
     save(LS.queue, this.queue);
     save(LS.recent, this.recent);
 
-    const label = value && sym.kind !== 'count' && sym.kind !== 'bool' ? `${sym.name}: ${value}` : sym.name;
+    const label = shown && sym.kind !== 'count' && sym.kind !== 'bool' ? `${sym.name}: ${shown}` : sym.name;
     this.showToast(`Logged ${label}`, e.id);
     await this.flush();
   }
@@ -205,7 +212,7 @@ class Store {
     this.version++;
   }
 
-  async update(id: string, patch: { value?: string | null; note?: string | null; occurred_at?: string }) {
+  async update(id: string, patch: Partial<EntryValue> & { note?: string | null; occurred_at?: string }) {
     const saved = await api.updateEntry(id, patch);
     this.recent = this.recent
       .map((r) => (r.id === id ? saved : r))

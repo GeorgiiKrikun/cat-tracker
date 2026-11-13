@@ -196,10 +196,15 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
         .await?,
     };
 
-    let syms: Vec<(i64, String, String, Option<String>)> =
-        sqlx::query_as("SELECT id, name, kind, options FROM symptom_types WHERE archived = 0")
+    let syms: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, name, kind FROM symptom_types WHERE archived = 0")
             .fetch_all(db)
             .await?;
+    let options: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT symptom_id, id FROM symptom_options WHERE retired = 0 ORDER BY sort_order, id",
+    )
+    .fetch_all(db)
+    .await?;
 
     // Small deterministic PRNG so demo data is the same every time.
     let mut seed: u64 = 42;
@@ -211,33 +216,32 @@ async fn seed_demo(db: &SqlitePool) -> anyhow::Result<()> {
     let mut count = 0;
     for day in 0..14i64 {
         let base = Utc::now() - chrono::Duration::days(day);
-        for (id, name, kind, options) in &syms {
-            let opts: Vec<String> = options
-                .as_deref()
-                .and_then(|o| serde_json::from_str(o).ok())
-                .unwrap_or_default();
-            let (times, value): (u64, Option<String>) = match kind.as_str() {
-                "med" => (if name == "Omeprazole" { 2 } else { 1 }, Some("given".into())),
+        for (id, name, kind) in &syms {
+            let opts: Vec<i64> = options.iter().filter(|(s, _)| s == id).map(|(_, o)| *o).collect();
+            let (times, value, option_id): (u64, Option<String>, Option<i64>) = match kind.as_str() {
+                "med" => (if name == "Omeprazole" { 2 } else { 1 }, Some("given".into()), None),
                 "scale" | "choice" if !opts.is_empty() => {
                     // Bias towards the middle options.
                     let i = ((rnd(opts.len() as u64) + rnd(opts.len() as u64)) / 2) as usize;
-                    (1 + rnd(2), Some(opts[i.min(opts.len() - 1)].clone()))
+                    (1 + rnd(2), None, Some(opts[i.min(opts.len() - 1)]))
                 }
-                "count" => (rnd(3).saturating_sub(1), Some("1".into())),
+                "count" => (rnd(3).saturating_sub(1), Some("1".into()), None),
                 "number" if name == "Weight" && day % 7 == 0 => {
-                    (1, Some(format!("{:.2}", 4.1 + (day as f64) * 0.01)))
+                    (1, Some(format!("{:.2}", 4.1 + (day as f64) * 0.01)), None)
                 }
-                _ => (0, None),
+                _ => (0, None, None),
             };
             for k in 0..times {
                 let at = base
                     - chrono::Duration::hours(2 + (k as i64) * 6)
                     - chrono::Duration::minutes(rnd(50) as i64);
                 sqlx::query(
-                    "INSERT INTO entries (id, symptom_id, value, logged_by, occurred_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO entries (id, symptom_id, option_id, value, logged_by, occurred_at)
+                     VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .bind(uuid::Uuid::new_v4().to_string())
                 .bind(id)
+                .bind(option_id)
                 .bind(&value)
                 .bind(uid)
                 .bind(at.to_rfc3339_opts(SecondsFormat::Millis, true))

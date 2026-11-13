@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { api, KIND_LABELS, type Kind, type Symptom } from '../lib/api';
+  import { api, hasOptions, KIND_LABELS, type Kind, type OptionInput, type Symptom, type SymptomInput } from '../lib/api';
   import Sheet from '../lib/Sheet.svelte';
   import { store } from '../lib/store.svelte';
 
   let all = $state<Symptom[]>([]);
   let editing = $state<Partial<Symptom> | null>(null);
-  let optionsText = $state('');
+  /** The option list being edited; `id` is missing for options not saved yet. */
+  type EditOption = OptionInput & { uses: number };
+  let opts = $state<EditOption[]>([]);
   let error = $state('');
   let busy = $state(false);
 
@@ -19,7 +21,7 @@
   const active = $derived(all.filter((s) => !s.archived));
   const archived = $derived(all.filter((s) => s.archived));
 
-  async function patch(s: Symptom, p: Partial<Symptom>) {
+  async function patch(s: Symptom, p: SymptomInput) {
     await api.updateSymptom(s.id, p);
     await Promise.all([load(), store.reloadSymptoms()]);
   }
@@ -35,28 +37,70 @@
 
   function openNew() {
     editing = { name: '', kind: 'bool', icon: '', unit: '', pinned: true, options: [] };
-    optionsText = '';
+    opts = [newOption(), newOption()];
     error = '';
   }
   function openEdit(s: Symptom) {
     editing = { ...s };
-    optionsText = s.options.join('\n');
+    opts = s.options.map((o) => ({ ...o }));
     error = '';
   }
 
-  const needsOptions = $derived(editing?.kind === 'scale' || editing?.kind === 'choice');
+  const needsOptions = $derived(hasOptions(editing?.kind));
+
+  // ---- option list editor ----
+  const newOption = (): EditOption => ({ label: '', retired: false, uses: 0 });
+  /** Indexes into `opts` of the active options, in order. */
+  const activeIdx = $derived(opts.flatMap((o, i) => (o.retired ? [] : [i])));
+  const retiredOpts = $derived(opts.filter((o) => o.retired));
+
+  function moveOpt(k: number, dir: -1 | 1) {
+    const a = activeIdx[k];
+    const b = activeIdx[k + dir];
+    if (b === undefined) return;
+    [opts[a], opts[b]] = [opts[b], opts[a]];
+  }
+  /** Unused options are simply removed; used ones are retired so their history stays. */
+  function retireOrRemove(i: number) {
+    if (opts[i].uses > 0) opts[i].retired = true;
+    else opts.splice(i, 1);
+  }
+  function unusedRetired(o: EditOption) {
+    opts.splice(opts.indexOf(o), 1);
+  }
+  async function merge(from: EditOption, intoId: number) {
+    const into = opts.find((o) => o.id === intoId);
+    if (!editing?.id || from.id === undefined || !into) return;
+    const n = from.uses === 1 ? '1 entry' : `${from.uses} entries`;
+    if (!confirm(`Move ${n} from “${from.label}” to “${into.label}” and delete “${from.label}”?\n\nThis rewrites history and can't be undone.`)) return;
+    error = '';
+    try {
+      await api.mergeOption(editing.id, from.id, intoId);
+      // Apply locally so other unsaved edits in the form survive.
+      into.uses += from.uses;
+      opts.splice(opts.indexOf(from), 1);
+      await Promise.all([load(), store.reloadSymptoms()]);
+      store.version++;
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
 
   async function saveEdit() {
     if (!editing) return;
     busy = true;
     error = '';
-    const body: Partial<Symptom> = {
+    const body: SymptomInput = {
       name: editing.name,
       icon: editing.icon || null,
       unit: editing.unit || null,
       pinned: editing.pinned,
     };
-    if (needsOptions) body.options = optionsText.split('\n').map((o) => o.trim()).filter(Boolean);
+    if (needsOptions) {
+      body.options = opts
+        .filter((o) => o.id !== undefined || o.label.trim()) // drop blank new rows
+        .map(({ id, label, retired }) => ({ id, label, retired }));
+    }
     try {
       if (editing.id) await api.updateSymptom(editing.id, body);
       else await api.createSymptom({ ...body, kind: editing.kind });
@@ -132,8 +176,60 @@
     {/if}
 
     {#if needsOptions}
-      <label for="s-opts">Options, one per line{editing.kind === 'scale' ? ' (worst/least first)' : ''}</label>
-      <textarea id="s-opts" bind:value={optionsText} rows="5" placeholder={'none\nlittle\nnormal'}></textarea>
+      <span class="label">Options{editing.kind === 'scale' ? ' (worst/least first)' : ''}</span>
+      <ul class="opts">
+        {#each activeIdx as i, k (opts[i])}
+          {@const o = opts[i]}
+          <li>
+            {#if editing.kind === 'scale'}
+              <span class="order">
+                <button onclick={() => moveOpt(k, -1)} disabled={k === 0} aria-label="Move up">▲</button>
+                <button onclick={() => moveOpt(k, 1)} disabled={k === activeIdx.length - 1} aria-label="Move down">▼</button>
+              </span>
+            {/if}
+            <input bind:value={o.label} placeholder="e.g. little" aria-label="Option {k + 1}" />
+            <span class="uses small muted">{o.uses ? `${o.uses}×` : ''}</span>
+            <button class="btn small-btn" onclick={() => retireOrRemove(i)}>{o.uses ? 'Retire' : 'Remove'}</button>
+          </li>
+        {/each}
+      </ul>
+      <button class="link" onclick={() => opts.push(newOption())}>+ Add option</button>
+      <p class="muted small hint">
+        Editing a label renames it everywhere, past entries included. To replace an option with something
+        different, retire it and add a new one: old entries keep the old option.
+      </p>
+
+      {#if retiredOpts.length}
+        <span class="label">Retired options</span>
+        <p class="muted small hint">Not offered when logging. Past entries and the summary still show them.</p>
+        <ul class="opts">
+          {#each retiredOpts as o (o)}
+            <li class="retired">
+              <span class="rlabel">{o.label} <span class="small muted">· {o.uses}×</span></span>
+              <button class="btn small-btn" onclick={() => (o.retired = false)}>Restore</button>
+              {#if o.uses && o.id !== undefined}
+                <select
+                  class="merge"
+                  aria-label="Merge {o.label} into another option"
+                  onchange={(ev) => {
+                    const t = ev.currentTarget;
+                    const into = Number(t.value);
+                    t.value = '';
+                    if (into) merge(o, into);
+                  }}
+                >
+                  <option value="">Merge into…</option>
+                  {#each opts.filter((x) => x !== o && x.id !== undefined) as t (t.id)}
+                    <option value={t.id}>{t.label}{t.retired ? ' (retired)' : ''}</option>
+                  {/each}
+                </select>
+              {:else if !o.uses}
+                <button class="btn small-btn" onclick={() => unusedRetired(o)}>Remove</button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
     {#if editing.kind === 'number'}
       <label for="s-unit">Unit</label>
@@ -174,5 +270,17 @@
   .save { margin-top: 18px; }
   .archive { margin-top: 10px; }
   .error { color: var(--bad); }
+  .label { display: block; font-size: 14px; color: var(--muted); margin: 14px 0 6px; }
+  .opts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .opts li { display: flex; align-items: center; gap: 6px; }
+  .opts input { flex: 1; min-width: 0; margin: 0; }
+  .opts .order button { width: 30px; height: 40px; }
+  .opts .uses { min-width: 28px; text-align: right; }
+  .opts .small-btn { min-height: 40px; padding: 0 12px; font-size: 14px; flex-shrink: 0; }
+  .opts li.retired { flex-wrap: wrap; }
+  .rlabel { flex: 1; font-style: italic; min-width: 0; overflow-wrap: anywhere; }
+  .merge { width: auto; min-height: 40px; margin: 0; font-size: 14px; }
+  .link { color: var(--accent); font-weight: 600; padding: 10px 0 0; }
+  .hint { margin: 6px 0 0; }
   code { background: var(--surface-2); padding: 1px 5px; border-radius: 5px; font-size: 13px; }
 </style>

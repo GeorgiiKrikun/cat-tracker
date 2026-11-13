@@ -8,52 +8,72 @@ A small installable web app (PWA) for logging a cat's symptoms and medications f
 - **Vet summary.** 7/14/30-day charts per symptom, printable as a PDF, plus CSV export.
 - **Works offline.** Entries logged without signal queue on the phone and sync later.
 
-Stack: **Rust** (Axum + SQLx + SQLite, argon2 passwords, cookie sessions) serving a **Svelte + Vite** PWA. One container, behind Nginx Proxy Manager.
+Stack: **Rust** (Axum + SQLx + SQLite, argon2 passwords, cookie sessions) serving a **Svelte + Vite** PWA. Built with **Nix**; deployed as one container behind Nginx Proxy Manager.
 
 ```
 backend/    Rust server: JSON API under /api + serves the built PWA
   migrations/   SQL schema + starter symptoms
 frontend/   Svelte PWA (manifest, service worker, icons)
-Dockerfile  builds both into one small image
+flake.nix   dev shell (Rust + Node) and builds: PWA, server, Docker image
 compose.yml         production (Nginx Proxy Manager network)
 compose.local.yml   run the production container locally
-Makefile            dev shortcuts
+justfile            dev shortcuts (`just` lists them)
 ```
 
 ## Local development
 
-Needs Rust (stable) and Node 20+. For auto-reload: `cargo install cargo-watch`.
+Needs only [Nix](https://nixos.org/download) with flakes enabled. It provides Rust, Node, cargo-watch, just and sqlite. No Docker needed.
 
 ```bash
-make seed            # demo user demo/demo + two weeks of fake data
-make dev-backend     # terminal 1: API on :8080
-make dev-frontend    # terminal 2: UI on :5173 with hot reload
+nix develop          # enter the dev shell (or `direnv allow` once, then it's automatic)
+just seed            # demo user demo/demo + two weeks of fake data
+just dev             # API on :8080 + UI on :5173 with hot reload, Ctrl-C stops both
 ```
+
+`just dev-backend` and `just dev-frontend` run the two halves separately, if you prefer two terminals.
 
 Open http://localhost:5173 and log in as `demo` / `demo`.
 
-Create real users with `make user NAME=georgii DISPLAY=Georgii`. You'll be prompted for the password.
+Create real users with `just user georgii Georgii`. You'll be prompted for the password.
 
-Other commands: `make test` (Rust tests + Svelte type check), `make clean-db`.
+Other commands: `just test` (Rust tests + Svelte type check), `just clean-db`.
+
+To run the production build without Docker: `CT_COOKIE_SECURE=false nix run . -- serve` (serves the bundled PWA on :8080, database in `./data`).
 
 ### Testing on a phone
 
 A PWA only installs and works offline over **HTTPS** (or on `localhost`), so `http://192.168.x.x:5173` won't install. Two options:
 
-- **Install test:** temporarily point an NPM proxy host at your laptop (e.g. `cat-dev.yourdomain.com → http://<laptop-ip>:8080` after `make build`, running the backend with `CT_STATIC_DIR=../frontend/dist`). Or use a tunnel like `cloudflared tunnel --url http://localhost:5173`.
+- **Install test:** temporarily point an NPM proxy host at your laptop (e.g. `cat-dev.yourdomain.com → http://<laptop-ip>:8080`, running `nix run . -- serve`). Or use a tunnel like `cloudflared tunnel --url http://localhost:5173`.
 - **UI check only:** plain `http://<laptop-ip>:5173` is fine for clicking around. Service worker and install won't work, but logging does.
 
 The service worker only registers in production builds, so it never caches stale code during `npm run dev`.
 
-## Deploying behind Nginx Proxy Manager
+## Docker image
 
-On the server:
+Nix builds the image (`dockerTools`), so there is no Dockerfile:
 
 ```bash
-git clone <this repo> cat-tracker && cd cat-tracker
+just docker          # nix build .#docker + docker load → cattracker:latest
+just docker-local    # same, then run it on http://localhost:8080
+```
+
+The image contains only the server, the PWA and their runtime libraries. It has no shell or base distro.
+
+## Deploying behind Nginx Proxy Manager
+
+Get `cattracker:latest` onto the server in one of two ways:
+
+- **Server has Nix:** clone the repo there and run `just docker`.
+- **Server has only Docker:** build on your machine and stream it over: `nix build .#docker && ssh <server> docker load < result`. The server then only needs `compose.yml`.
+
+Then on the server:
+
+```bash
+cd cat-tracker
 docker network ls                         # find NPM's network, e.g. npm_default
 mkdir -p data && sudo chown 10001 data    # container runs as uid 10001
-NPM_NETWORK=npm_default docker compose up -d --build
+NPM_NETWORK=npm_default docker compose up -d
 docker compose exec cattracker cattracker add-user georgii --display-name Georgii
 docker compose exec cattracker cattracker add-user <wife> --display-name <Name>
 ```
@@ -70,7 +90,9 @@ Then open the URL on each phone:
 
 Sessions last 90 days and renew while the app is used, so you won't keep logging in.
 
-**Updating:** `git pull && docker compose up -d --build`.
+**Updating:** load the new image (`git pull && just docker` on the server, or the `ssh … docker load` line above), then `docker compose up -d`.
+
+**Updating dependencies:** `nix flake update` bumps the toolchain. Cargo and npm deps come from `Cargo.lock` and `package-lock.json`, so no hashes need editing.
 
 **Backups:** everything is in `data/cattracker.db`. For a consistent copy while it's running:
 
@@ -117,6 +139,15 @@ Symptoms are rows in `symptom_types`, and each has a **kind** that decides how i
 
 The starter set lives in `backend/migrations/0001_init.sql`. Everything is editable in the app. A symptom's kind can't change after creation, because that would make old entries meaningless; archive it and create a new one instead.
 
+### Options (scale and choice)
+
+Options live in `symptom_options`, and entries point at them by id. That way history stays correct when options change:
+
+- **Rename** an option by editing its label. Every past entry shows the new name.
+- **Retire** an option when you replace it with something different (e.g. "soft / hard" → "diarrhea / porridge / sausage / stone"). It's no longer offered when logging. Old entries keep it, and the summary shows it as a greyed row while it has entries in the period. There's no automatic mapping, because only you know what an old "soft" meant.
+- **Merge** a retired option into another one to move its entries over, for typos or duplicates. This is the only operation that rewrites history, and it asks first.
+- An option with no entries can simply be removed. One with entries can't be deleted.
+
 ## API (all JSON, cookie auth)
 
 ```
@@ -126,10 +157,12 @@ GET    /api/me
 GET    /api/symptoms[?include_archived=true]
 POST   /api/symptoms          {name, kind, options?, unit?, icon?, pinned?}
 PATCH  /api/symptoms/{id}     any of: name, options, unit, icon, pinned, archived
+                              options = full ordered list [{id?, label, retired}]; no id = new
+POST   /api/symptoms/{id}/options/{option_id}/merge   {into: option_id}
 PUT    /api/symptoms/order    [id, id, …]
 GET    /api/entries?from=&to=&symptom_id=&limit=
-POST   /api/entries           {id?: uuid, symptom_id, value?, note?, occurred_at?}   (idempotent on id)
-PATCH  /api/entries/{id}      {value?, note?, occurred_at?}
+POST   /api/entries           {id?: uuid, symptom_id, value? | option_id?, note?, occurred_at?}   (idempotent on id)
+PATCH  /api/entries/{id}      {value? | option_id?, note?, occurred_at?}
 DELETE /api/entries/{id}
 GET    /api/export.csv?from=&to=
 ```
