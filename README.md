@@ -17,7 +17,6 @@ backend/    Rust server: JSON API under /api + serves the built PWA
   migrations/   SQL schema
 frontend/   Svelte PWA (manifest, service worker, icons)
 flake.nix   dev shell (Rust + Node) and builds: PWA, server, Docker image
-compose.yml         production (Nginx Proxy Manager network)
 compose.local.yml   run the production container locally
 justfile            dev shortcuts (`just` lists them)
 ```
@@ -76,23 +75,17 @@ The image contains only the server, the PWA and their runtime libraries. It has 
 
 ## Deploying behind Nginx Proxy Manager
 
-Get `cattracker:latest` onto the server in one of two ways:
+Production config lives in the [infra repo](https://github.com/GeorgiiKrikun/infra) (`cattracker/compose.yml`), not here. On every push to `main`, CI (`.github/workflows/image.yml`) builds the image with Nix and pushes `ghcr.io/georgiikrikun/cattracker:sha-<7 chars>` and `:main`. The server only pulls it. The container runs as the server's shared app user (1000:1000) and keeps its database in `/srv/data/cattracker`.
 
-- **Server has Nix:** clone the repo there and run `just docker`.
-- **Server has only Docker:** build on your machine and stream it over: `nix build .#docker && ssh <server> docker load < result`. The server then only needs `compose.yml`.
-
-Then on the server:
+First setup, on the server in `/srv/infra`:
 
 ```bash
-cd cat-tracker
-docker network ls                         # find NPM's network, e.g. npm_default
-mkdir -p data && sudo chown 10001 data    # container runs as uid 10001
-NPM_NETWORK=npm_default docker compose up -d
-docker compose exec cattracker cattracker add-user georgii --display-name Georgii
-docker compose exec cattracker cattracker add-user <wife> --display-name <Name>
-docker compose exec cattracker cattracker add-patient Murka --icon 🐱 --preset cat
-docker compose exec cattracker cattracker share Murka georgii
-docker compose exec cattracker cattracker share Murka <wife>
+just deploy cattracker
+docker exec cattracker cattracker add-user georgii --display-name Georgii
+docker exec cattracker cattracker add-user <wife> --display-name <Name>
+docker exec cattracker cattracker add-patient Murka --icon 🐱 --preset cat
+docker exec cattracker cattracker share Murka georgii
+docker exec cattracker cattracker share Murka <wife>
 ```
 
 In the Nginx Proxy Manager UI:
@@ -107,7 +100,7 @@ Then open the URL on each phone:
 
 Sessions last 90 days and renew while the app is used, so you won't keep logging in.
 
-**Updating:** load the new image (`git pull && just docker` on the server, or the `ssh … docker load` line above), then `docker compose up -d`.
+**Updating:** push to `main`, wait for CI, set the new `sha-…` tag in infra's `cattracker/compose.yml`, then run `just deploy cattracker` on the server.
 
 **Updating dependencies:** `nix flake update` bumps the toolchain. Cargo and npm deps come from `Cargo.lock` and `package-lock.json`, so no hashes need editing.
 
