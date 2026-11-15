@@ -3,15 +3,19 @@ mod auth;
 mod error;
 mod patients;
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context;
 use axum::{
     Router,
-    extract::Request,
-    http::{HeaderValue, header},
+    extract::{Request, State},
+    http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
@@ -140,11 +144,45 @@ fn read_password(prompt: &str) -> anyhow::Result<String> {
     Ok(p1)
 }
 
-/// Long-lived caching for hashed build assets, no caching for the app shell
+/// Long-lived caching for hashed build assets, revalidation for the app shell
 /// and service worker so updates show up promptly.
-async fn cache_headers(req: Request, next: Next) -> Response {
+///
+/// Files in the Nix store all have mtime 1970, so ServeDir's own Last-Modified/ETag
+/// never change between builds and browsers kept getting 304 for a stale index.html.
+/// Unhashed files get `shell_etag` instead (see `shell_etag`), or no validator at all.
+async fn cache_headers(
+    State(shell_etag): State<Option<HeaderValue>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let path = req.uri().path().to_owned();
+    let unhashed = !path.starts_with("/api/") && !path.starts_with("/assets/");
+    let mut not_modified = false;
+    if unhashed {
+        let h = req.headers_mut();
+        h.remove(header::IF_MODIFIED_SINCE);
+        if let (Some(tag), Some(inm)) = (&shell_etag, h.remove(header::IF_NONE_MATCH)) {
+            not_modified = etag_matches(&inm, tag);
+        }
+    }
     let mut res = next.run(req).await;
+    if unhashed {
+        let h = res.headers_mut();
+        h.remove(header::LAST_MODIFIED);
+        h.remove(header::ETAG);
+        if res.status() == StatusCode::OK
+            && let Some(tag) = shell_etag
+        {
+            if not_modified {
+                let mut headers = std::mem::take(res.headers_mut());
+                headers.remove(header::CONTENT_LENGTH);
+                headers.remove(header::CONTENT_TYPE);
+                res = StatusCode::NOT_MODIFIED.into_response();
+                *res.headers_mut() = headers;
+            }
+            res.headers_mut().insert(header::ETAG, tag);
+        }
+    }
     let value = if path.starts_with("/api/") {
         "no-store"
     } else if path.starts_with("/assets/") {
@@ -165,13 +203,31 @@ async fn cache_headers(req: Request, next: Next) -> Response {
     res
 }
 
+/// `If-None-Match` lists the tags the browser has; weak comparison, as for GET.
+fn etag_matches(if_none_match: &HeaderValue, tag: &HeaderValue) -> bool {
+    let strip = |t: &str| t.trim().trim_start_matches("W/").to_owned();
+    let (Ok(inm), Ok(tag)) = (if_none_match.to_str(), tag.to_str()) else { return false };
+    let tag = strip(tag);
+    inm.split(',').any(|t| t.trim() == "*" || strip(t) == tag)
+}
+
+/// One validator for every unhashed UI file: the hash in the UI's Nix store path,
+/// which changes whenever any file in it does. Weak, since compression changes the bytes.
+/// Outside the Nix store (local builds) there is none, so those files are always sent.
+fn shell_etag(static_dir: &Path) -> Option<HeaderValue> {
+    let name = static_dir.canonicalize().ok()?.strip_prefix("/nix/store").ok()?.to_str()?.to_owned();
+    let hash = name.split('-').next().filter(|h| !h.is_empty())?;
+    HeaderValue::from_str(&format!("W/\"{hash}\"")).ok()
+}
+
 pub fn app(state: AppState, static_dir: PathBuf) -> Router {
+    let shell_etag = shell_etag(&static_dir);
     let index = static_dir.join("index.html");
     let spa = ServeDir::new(&static_dir).fallback(ServeFile::new(index));
     Router::new()
         .nest("/api", api::router())
         .fallback_service(spa)
-        .layer(middleware::from_fn(cache_headers))
+        .layer(middleware::from_fn_with_state(shell_etag, cache_headers))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -410,6 +466,18 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn etag_matching() {
+        let tag = HeaderValue::from_static(r#"W/"abc""#);
+        let m = |inm: &'static str| etag_matches(&HeaderValue::from_static(inm), &tag);
+        assert!(m(r#"W/"abc""#));
+        assert!(m(r#""abc""#));
+        assert!(m(r#""x", W/"abc""#));
+        assert!(m("*"));
+        assert!(!m(r#""1.00000000-3cf""#));
+        assert!(!m(r#""abcd""#));
+    }
 
     struct TestApp {
         router: Router,
