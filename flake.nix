@@ -19,6 +19,8 @@
           inherit (pkgs) lib;
           fs = lib.fileset;
           version = (lib.importTOML ./backend/Cargo.toml).package.version;
+          # Commit the build came from, shown in Settings and at /api/version (matches the image's sha- tag).
+          rev = self.shortRev or self.dirtyShortRev or "unknown";
 
           # The built PWA (what `npm run build` puts in frontend/dist).
           frontend = pkgs.buildNpmPackage {
@@ -36,6 +38,7 @@
             # Dependencies come straight from package-lock.json, so there is no hash to update.
             npmDeps = pkgs.importNpmLock { npmRoot = ./frontend; };
             npmConfigHook = pkgs.importNpmLock.npmConfigHook;
+            env.VITE_GIT_SHA = rev;
             installPhase = ''
               runHook preInstall
               cp -r dist $out
@@ -71,7 +74,8 @@
               }
               ''
                 makeBinaryWrapper ${lib.getExe backend} $out/bin/cattracker \
-                  --set-default CT_STATIC_DIR ${frontend}
+                  --set-default CT_STATIC_DIR ${frontend} \
+                  --set-default CT_GIT_SHA ${rev}
               '';
 
           # Production image: `nix build .#docker && docker load < result`

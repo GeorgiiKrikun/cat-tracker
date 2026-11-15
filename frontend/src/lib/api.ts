@@ -154,7 +154,11 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 /** Everything about trackers and entries lives under the patient it belongs to. */
 const pp = (pid: number) => `/patients/${pid}`;
 
+/** Commit this UI was built from (set by the Nix build), "dev" otherwise. */
+export const GIT_SHA: string = import.meta.env.VITE_GIT_SHA ?? 'dev';
+
 export const api = {
+  version: () => request<{ version: string; sha: string }>('GET', '/version'),
   me: () => request<User>('GET', '/me'),
   login: (username: string, password: string) =>
     request<User>('POST', '/auth/login', { username, password }),

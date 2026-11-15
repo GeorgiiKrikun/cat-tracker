@@ -24,6 +24,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/version", get(version))
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
@@ -37,6 +38,12 @@ pub fn router() -> Router<AppState> {
         .route("/patients/{pid}/entries/{id}", patch(update_entry).delete(delete_entry))
         .route("/patients/{pid}/checkins", get(list_checkins).post(create_checkin))
         .route("/patients/{pid}/checkins/{id}", delete(delete_checkin))
+}
+
+/// Which build is running; `sha` is the commit (set by the Nix build), "dev" otherwise.
+async fn version() -> Json<serde_json::Value> {
+    let sha = std::env::var("CT_GIT_SHA").unwrap_or_else(|_| "dev".into());
+    Json(json!({ "version": env!("CARGO_PKG_VERSION"), "sha": sha }))
 }
 
 // ---------- auth ----------

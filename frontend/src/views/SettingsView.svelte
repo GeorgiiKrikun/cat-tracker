@@ -2,6 +2,7 @@
   import {
     api,
     byCategory,
+    GIT_SHA,
     hasOptions,
     KIND_LABELS,
     type Kind,
@@ -33,6 +34,9 @@
     }
     load().catch(() => (all = store.trackers));
   });
+
+  let serverSha = $state('…');
+  api.version().then((v) => (serverSha = v.sha), () => (serverSha = 'unreachable'));
 
   const active = $derived(all.filter((s) => !s.archived));
   const archived = $derived(all.filter((s) => s.archived));
@@ -197,6 +201,7 @@
 <p class="muted small">
   People and patients are managed on the server: <code>cattracker add-user</code>, <code>add-patient</code>, <code>share</code>.
 </p>
+<p class="muted small">App {GIT_SHA} · Server {serverSha}</p>
 
 {#if editing}
   <Sheet title={editing.id ? `Edit ${editing.name}` : 'New tracker'} onclose={() => (editing = null)}>
