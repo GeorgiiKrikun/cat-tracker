@@ -44,6 +44,7 @@
   }
 
   async function openEdit(e: Entry | string) {
+    store.toast = null;
     const entry = typeof e === 'string' ? store.recent.find((r) => r.id === e) : e;
     if (!entry) return;
     try {
@@ -149,7 +150,7 @@
       {#if store.toast.undoId}
         {@const id = store.toast.undoId}
         {@const checkin = store.toast.checkin}
-        {#if !checkin}<button onclick={() => { store.toast = null; openEdit(id); }}>Edit</button>{/if}
+        {#if !checkin}<button onclick={() => openEdit(id)}>Edit</button>{/if}
         <button onclick={() => store.undo(id, checkin)}>Undo</button>
       {/if}
     </div>
